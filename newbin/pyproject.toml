@@ -1,0 +1,83 @@
+[build-system]
+requires = ["setuptools>=77", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "newbin"
+dynamic = ["version"]
+description = "Metagenomic binning with custom deep learning models"
+readme = "README.md"
+requires-python = ">=3.11"
+license = "MIT"
+authors = [
+    { name = "Your Name" },
+]
+classifiers = [
+    "Development Status :: 3 - Alpha",
+    "Intended Audience :: Science/Research",
+    "Topic :: Scientific/Engineering :: Bio-Informatics",
+    "Topic :: Scientific/Engineering :: Artificial Intelligence",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+]
+dependencies = [
+    "numpy",
+    "pandas>=3",
+    "torch>=1.13",
+    "scikit-learn",
+    "python-igraph",
+    "scipy",
+    "numexpr",
+    "tqdm",
+    "argcomplete",
+]
+
+[project.optional-dependencies]
+dev = ["pytest", "hypothesis"]
+
+[project.scripts]
+newbin = "newbin.main:main"
+
+[tool.setuptools]
+packages = ["newbin"]
+include-package-data = true
+zip-safe = false
+
+[tool.setuptools.package-data]
+newbin = ["*.hmm", "models/*.pt"]
+
+[tool.setuptools.dynamic]
+version = {attr = "newbin.newbin_version.__version__"}
+
+
+# ---------------------------------------------------------------------------
+# Pixi 配置（与 SemiBin 保持一致：管理外部二进制依赖 + Python 环境）
+# ---------------------------------------------------------------------------
+[tool.pixi.workspace]
+channels = ["conda-forge", "bioconda"]
+platforms = ["win-64", "linux-64", "osx-arm64"]
+
+[tool.pixi.dependencies]
+python = ">=3.11"
+bedtools = ">=2.31.1,<3"
+hmmer = ">=3.4,<4"
+prodigal = ">=2.6.3,<3"
+fraggenescan = ">=1.32,<2"
+samtools = ">=1.21,<2"
+
+[tool.pixi.pypi-dependencies]
+newbin = { path = ".", editable = true }
+
+[tool.pixi.feature.test]
+dependencies = { pytest = "*", hypothesis = "*", uv = "*" }
+
+[tool.pixi.feature.py311]
+dependencies = { python = "3.11.*" }
+
+[tool.pixi.feature.py312]
+dependencies = { python = "3.12.*" }
+
+[tool.pixi.environments]
+default = ["py312"]
+test-py311 = ["py311", "test"]
+test-py312 = ["py312", "test"]

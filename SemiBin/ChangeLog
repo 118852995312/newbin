@@ -1,0 +1,293 @@
+Unreleased
+	* SemiBin: Require pandas>=3
+	* SemiBin: Drop support for Python 3.10 (minimum is now Python 3.11)
+	* check_install: Add 'check-install' as a synonym
+	* SemiBin: Support shell tab completion via argcomplete
+	* SemiBin.main: Add semibin_arg_parser() to build the argument parser
+	  (enables generating static shell completion scripts with shtab)
+	* generate_sequence_features_multi/multi_easy_bin: Fail early with a
+	  clear message (listing the samples) when some samples have no contig
+	  long enough to reach the must-link threshold (previously the run
+	  failed later with an obscure error during training) (#159, #164)
+
+Version 2.5.0 Sep 15 2026 by BigDataBiology
+	* utils.concatenate_fasta: Add 'keep_full_header' argument to
+	  preserve the full FASTA header (beyond the contig ID) when
+	  concatenating files
+
+Version 2.4.1 Aug 04 2026 by BigDataBiology
+	* single_easy_bin/generate_sequence_features_single: Fail early
+	  with a clear message when no contig is long enough to reach the
+	  must-link threshold (previously the run failed later with an
+	  obscure error)
+
+Version 2.4.0 Jul 18 2026 by BigDataBiology
+	* packaging: Fix setuptools build warnings by using an SPDX
+	  license expression and explicitly declaring the models and
+	  skills data subpackages
+	* single_easy_bin: Fix '--cannot-name' being ignored by the
+	  training step (the cannot-link file path was hard-coded to
+	  'cannot.txt' instead of using the user-provided name)
+	* binning: Log a summary at the end of binning (number of bins,
+	  fraction of contigs and basepairs binned vs unbinned, and mean/
+	  median bin size and contigs-per-bin)
+	* install-skills: Add subcommand to install the bundled agent
+	  skill (which teaches coding agents to drive SemiBin2 correctly)
+	  into a project-local ./.claude/skills (default) or the
+	  user-wide $HOME/.claude/skills (with --user)
+	* SemiBin: Drop support for Python 3.8 (minimum is now Python 3.9)
+	* SemiBin: Drop support for Python 3.9 (minimum is now Python 3.10)
+	* SemiBin: Use zip(..., strict=True) for paired-array iterations
+	  to catch silent length-mismatch bugs in clustering, marker
+	  handling, and feature generation
+	* single_easy_bin: Fix TypeError when combining '--environment'
+	  with abundance files ('-a') instead of BAM files; the
+	  unsupported combination is now rejected cleanly
+	* GTDB download: Include the underlying error message when
+	  extracting the GTDB tarball fails, instead of a generic
+	  'cannot untar the file'
+	* SemiBin: Fix several broken/garbled error messages (a missing
+	  space merged two sentences in check_install; the
+	  '--train-from-many' shape-mismatch message was unreadable; the
+	  pretrained-model message now reads 'can only be used for')
+	* SemiBin: Route fatal error messages through the logger instead
+	  of writing directly to stderr, so they are timestamped and
+	  recorded in SemiBinRun.log; also drop the redundant 'Error:'
+	  prefix and trailing newline from logged errors
+
+Version 2.3.0 May 26 2026 by BigDataBiology
+	* SemiBin1: removed
+	* SemiBin: Accept 'hybrid' as a synonym for 'long_read' in --sequencing-type (#216)
+	* SemiBin: Remove '--environment' parameter in command that learns a new model (#218)
+	* single_easy_bin: Fix AttributeError on 'training_type' when running
+	  with abundance files (-a) instead of BAM files
+	* semi-supervised: Fix wrong input in unlabeled contrastive learning
+	  (both branches received identical data, defeating the unlabeled-pair
+	  contrastive signal)
+	* long-read clustering: Clip zero depth values before np.log
+	  (previously produced -inf values that silently corrupted the embedding)
+	* utils: Fix split_data matching sample names that are prefixes of others
+	  (use str.startswith() instead of str.contains())
+	* markers: Validate cached markers.hmmout against input fingerprint
+	  (FASTA size/mtime, binned_length, ORF finder) to avoid silently
+	  reusing stale marker calls when reruns target an existing output dir
+	* long-read binning: Remove stale output bins from previous runs before
+	  writing new results
+	* SemiBin: Empty FASTA inputs now fail cleanly with a user-facing error
+	  instead of crashing with ZeroDivisionError / argmax-on-empty
+	* orffinding: Fix prodigal errors being silently ignored
+	* model_load: Raise ValueError for unknown model name (instead of
+	  UnboundLocalError)
+	* check_install: Fix logic when checking for prodigal
+	* check_install: Soft-check for samtools (warns when missing in verbose
+	  mode but does not fail; samtools is only required for CRAM input)
+	* SemiBin: Mark --allow-missing-mmseqs2 as deprecated in help text
+	* SemiBin: Update data-generation log message to distinguish training
+	  from inference with a pretrained model (#219)
+	* self-supervised: Read training CSVs once instead of every epoch
+	* orffinding: Fix unclosed file handle in run_prodigal
+	* pyproject: Remove unused pyyaml dependency
+	* Add Python 3.14 to the tested Python versions
+	* Add missing COPYING.MIT license file (#214)
+	* docs: Fix multiple documentation issues (outdated output descriptions,
+	  wrong split_contigs output filename, removed CLI option references,
+	  inaccurate required arguments, installation inconsistencies, broken
+	  links, Python version ranges, --random-seed help text, CITATION DOI,
+	  --depth-metabat2 mention on subcommand without that option, etc.)
+
+Version 2.2.1 Dec 7 2025 by BigDataBiology
+	* SemiBin: Add support for `SEMIBIN_DEBUG` environment variable
+	* cluster: Fix call to newer infomap (#208)
+
+Version 2.2.0 Mar 20 2025 by BigDataBiology
+	* logging: Use 'SemiBin2' as logger name
+	* SemiBin: Always log to file in DEBUG level and log command-line arguments
+	* coverage: Better error messages (#168)
+	* SemiBin: Print version number in logs
+	* SemiBin: Better method to save the model which is more compatible with
+	newer versions of PyTorch
+	* update_model: Add subcommand to convert old models to new format
+	* SemiBin: Respect the number of threads requested better (#140)
+	* SemiBin: Switch to pixi
+	* check_install: Prints out information on the GPU
+	* check_install: No error if MMseqs2 is not installed
+	* SemiBin: Remove `SemiBin` command. Only `SemiBin1` and `SemiBin2` are
+	available (and `SemiBin1` is deprecated)
+	* SemiBin: Deprecate `--prodigal-output-faa` argument
+	* SemiBin: Do not fail if no bins are produced (#170 & #173)
+
+Version 2.1.0 Mar 6 2024 by BigDataBiology
+	* SemiBin: Support running SemiBin with strobealign-aemb
+	(--abundance/-a)
+	* citation: Add citation subcommand
+	* SemiBin1: Introduce separate SemiBin1 command
+	* internal: Code simplification and refactor
+	* deprecation: Deprecate --orf-finder=fraggenescan option
+	* Update abundance normalization
+	* SemiBin: do not use more processes than can be taken advantage of (#155)
+
+Version 2.0.2 Oct 31 2023 by BigDataBiology
+	* multi_easy_bin: Fix multi_easy_bin with --write-pre-recluster (#128)
+
+Version 2.0.1 Oct 21 2023 by BigDataBiology
+	* train_self: Fix bug with --mode
+	* concatenate_fasta: Fix bug with compression
+	* bin_short: Make alias work
+
+Version 2.0.0 Oct 20 2023 by BigDataBiology
+	* SemiBin: Better error checking throughout
+	* SemiBin: Write a log file
+	* concatenate_fasta: support compression
+	* concatenate_fasta: slightly better error message when contig ID already
+	contains separator
+	* SemiBin: add `bin_short` as alias for `bin`
+
+Version 1.5.1 (SemiBin2 beta) Mar 7 2023 by BigDataBiology
+	* Bugfix: using --no-recluster with multi_easy_bin (#128)
+
+Version 1.5.0 (SemiBin2 beta) Jan 17 2023 by BigDataBiology
+	* Add `SemiBin2` script
+	* Added naive ORF finder
+	* Add `--prodigal-output-faa` argument (#113)
+	* Make command line arguments more flexible for --sequencing-type argument
+	* Argument checking is more exhaustive instead of exiting at first error
+	* Add `--quiet` argument
+	* Add `--compression` option
+	* Add `--tag-output` option
+	* Better `--help` (group required arguments separately)
+	* Make SemiBin.main.main2 callable with a list of arguments
+	* Add contig -> bin mapping table (#123)
+
+Version 1.4.0 Dec 15 2022 by BigDataBiology
+	* Provide binning algorithm for assemblies from long read
+	* Add `--allow-missing-mmseqs2` flag to `check_install` subcommand
+	* Run Prodigal in multiple jobs without multiprocessing (#106)
+	* Better command line arguments
+	* Better error checking
+
+Version 1.3.1 Dec 9 2022 by BigDataBiology
+	* Make `--training-type` argument optional
+
+Version 1.3.0 Nov 4 2022 by BigDataBiology
+	* Add self-supervised learning
+	* Fix output table to contain correct paths
+	* Accept `--epochs` as argument in the command line (previously it was
+	spelled `--epoches`
+
+Version 1.2.0 Oct 19 2022 by BigDataBiology
+	* Pretrained model from chicken caecum
+	* Output table with basic information on bins (including N50 & L50)
+	* When reclustering is used (default), output the unreclusted bins into a
+	directory called `output_prerecluster_bins`
+	* Added --verbose flag and silenced some of the output when it is not used
+	* Use coloredlogs (if package is available)
+
+Version 1.1.1 Sep 27 2022 by BigDataBiology
+	* Completely remove use of atomicwrites package
+
+Version 1.1.0 Sep 21 2022 by BigDataBiology
+    * Fix bug when atomicwrite on the network file system (#97)
+    * support .cram format input (#104)
+    * Support using depth file from Metabat2 (#103)
+	* Remove torch version restriction (and test on Python 3.10)
+	* Better output message when no bins are produced
+	* More flexible specification of prebuilt models (case insensitive,
+	normalize - and _)
+	* Support CRAM input (#104)
+	* Better output message when no bins are produced
+	* Remove torch version restriction (and test on Python 3.10)
+	* Support filesystems that do allow you to call fsync on directories (#97)
+
+Version 1.0.3 Wed Aug 3 2022 by BigDataBiology
+	* Fix coverage parsing when value is not an integer (#103)
+	* Fix multi_easy_bin with taxonomy file given on the command line
+
+Version 1.0.2 Fri 8 Jul 2022 by BigDataBiology
+	* Fix issue #93 more thoroughly (see #101)
+
+Version 1.0.1 Mon 9 May 2022 by BigDataBiology
+	* Fix edge case when calling prodigal with more threads than contigs (#93)
+
+Version 1.0.0 Fri 29 Apr 2022 by BigDataBiology
+	* More balanced file split when calling prodigal in parallel
+	* Fix bug when long stretches of Ns are present (#87)
+	* Better error messages (#90 & #91)
+
+Version 0.7.0 Wed 3 Mar 2022 by BigDataBiology
+	* Improve `check_install` command by printing out paths and correctly
+	handling optionality of FragGeneScan/prodigal
+	* Reuse markers.hmmout to make the training from several samples faster
+	* Add option `--tmpdir` to set temporary directory
+	* Substitute FragGeneScan with Prodigal (FragGeneScan can still be used
+	with `--orf-finder` parameter)
+	* Add 'concatenate_fasta' command to combine fasta files for multi-sample binning
+
+Version 0.6.0 Mon 7 Feb 2022 by BigDataBiology
+	* Provide pretrained models from soil, cat gut, human oral,
+	pig gut, mouse gut, built environment, wastewater and global (training
+	from all environments).
+	* Add `check_install` command and run `check_install` before easy* command
+	* The user can now specify a pre-computed contig annotation table in
+	mmseqs format
+	* Fix bug with non-standard characters in sample names (#68)
+	* Better subcommand names (`generate_sequence_features_*` and
+	`generate_cannot_links`)
+
+Version 0.5.0 Fri Jan 7 2022 by BigDataBiology
+	* Faster `SemiBin --version`
+	* Lower memory usage and faster speed for `bin` subcommand
+	* Reclustering is now the default (due to improved speed). Added
+	`--no-recluster` option to disable it
+	* Output of bedtools is now processed as a stream instead of using a
+	(potentially large) intermediate file
+	* Fix bug with --min-len. Previously, only contigs greater than the given
+	minimal length were used (instead of greater-equal to the minimal length).
+	* Fix bugs downloading GTDB
+	* Respect $XDG_CACHE_DIR if set
+	* Implement CACHEDIR.TAG protocol for the SemiBin cache directory
+
+Version 0.4.0 Tue Oct 10 2021 by BigDataBiology
+	* Add support for .xz FASTA files as inputs
+	* Removed BioPython dependency
+	* Fixed bug in FASTA unzipping
+	* Fixed bug in multi-sample data splitting
+
+Version 0.3.0 Mon Aug  9 2021 by BigDataBiology
+	* Support training from several samples
+	* Remove `output_bin_path` if `output_bin_path` exists
+	* Make several internal parameters configuable (1) minimum length of
+	contigs to bin (`--min-len` parameter); (2) minimum length of contigs to
+	break up in order to generate _must-link_ constraints (`--ml-threshold`
+	parameter); (3) the ratio of the number of base pairs of contigs between
+	1000-2500 bp smaller than this value, the minimal length will be set as
+	1000bp, otherwise 2500bp
+	* Add `-p` argument for `predict_taxonomy` mode
+	* Fix `np.concatenate` warning
+	* Remove redundant matrix when clustering
+	* Better pretrained models
+	* Faster calculating dapth using Numpy
+	* Use correct number of threads in `kneighbors_graph()`
+	* Respect number of threads (`-p` argument) when training (issue 34)
+
+
+
+Version 0.2.0 Thu May 27 2021 by BigDataBiology
+	* Change name to `SemiBin`
+	* Add support for training with several samples
+	* Test with Python 3.9
+	* Download mmseqs database with `--remove-tmp-file 1`
+	* Better output names
+	* Fix bugs when paths have spaces
+	* Fix installation issues by listing all the dependencies
+	* Add `download_GTDB` command
+	* Add `--no-recluster` option
+	* Add `--environment` option
+	* Add `--mode` option
+	* All around more robust code by including more error checking & testing
+	* Better built-in models
+
+Version 0.1.1 Sun 21 Mar 2021 by BigDataBiology
+	* Fix bug with --minfasta-kbs
+
+Version 0.1.0 Sun 21 Mar 2021 by BigDataBiology
+	* First (alpha) release

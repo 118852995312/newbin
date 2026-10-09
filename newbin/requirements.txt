@@ -1,0 +1,9 @@
+numpy
+pandas>=3
+torch>=1.13
+scikit-learn
+python-igraph
+scipy
+numexpr
+tqdm
+argcomplete

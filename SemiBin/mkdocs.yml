@@ -1,0 +1,28 @@
+site_name: "SemiBin"
+repo_url: "https://github.com/BigDataBiology/SemiBin"
+repo_name: "GitHub"
+
+theme:
+    name: readthedocs
+    highlightjs: true
+    html_show_sourcelink: false
+    prev_next_buttons_location: both
+
+markdown_extensions:
+    - admonition
+
+nav:
+        - 'SemiBin': index.md
+        - 'Install': install.md
+        - 'Usage examples': usage.md
+        - 'SemiBin2 compared to SemiBin1': semibin2.md
+        - 'Generating inputs to SemiBin': generate.md
+        - 'Output': output.md
+        - 'Running AEMB': aemb.md
+        - "Subcommand reference": subcommands.md
+        - "What's New": whatsnew.md
+        - "Training SemiBin models": training.md
+        - "AI integration": ai-integration.md
+        - "FAQ": faq.md
+        - "Using semi-supervised binning": semi-supervised.md
+

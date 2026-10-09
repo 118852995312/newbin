@@ -1,0 +1,14 @@
+/build/
+/dist/
+/SemiBin.egg-info/
+__pycache__/
+.hypothesis/
+/test-outputs/
+/test/single_sample_data/input.fasta.fai
+/test/multi_samples_data/input_multi.fasta.fai
+/test/multi_samples_data/input_multi_full.fasta.fai
+
+# pixi environments
+.pixi
+*.egg-info
+.pytest_cache/
