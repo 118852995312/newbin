@@ -41,21 +41,55 @@ def generate_feature_mapping(kmer_len):
     return kmer_hash, counter
 
 
-def generate_kmer_features_from_fasta(fasta_file, length_threshold, kmer_len):
+def _build_lut_4mer(kmer_dict):
+    """
+    针对 4-mer 构建一个快速单字节查找表（LUT）。
+    ASCII 碱基映射为 2-bit：A:0, C:1, G:2, T:3，非标准碱基标记为 255。
+    4-mer 对应的 8-bit 整数 (0..255) 直接映射到 canonical 特征索引 (0..135)。
+    """
+    byte_map = np.full(256, 255, dtype=np.uint8)
+    for b, code in [('A', 0), ('a', 0), ('C', 1), ('c', 1), ('G', 2), ('g', 2), ('T', 3), ('t', 3)]:
+        byte_map[ord(b)] = code
+
+    lut = np.full(256, -1, dtype=np.int32)
+    base_map = {'A': 0, 'C': 1, 'G': 2, 'T': 3}
+    for kmer, feat_id in kmer_dict.items():
+        idx = (base_map[kmer[0]] << 6) | (base_map[kmer[1]] << 4) | (base_map[kmer[2]] << 2) | base_map[kmer[3]]
+        lut[idx] = feat_id
+    return byte_map, lut
+
+
+def generate_kmer_features_from_fasta(
+        fasta_file,
+        length_threshold,
+        kmer_len=4,
+        split=False,
+        split_threshold=0,
+        contig_whitelist=None):
     """
     从 FASTA 文件中提取每条序列的归一化 k-mer 频率特征。
 
     读取 FASTA 序列，过滤掉长度低于阈值的序列，统计每条序列的 k-mer 频次（合并反向互补序列），
     并加入微小伪计数（1e-5）后按行进行归一化（使每条序列的频率总和为 1）。
 
+    针对 4-mer（默认）引入 2-bit 位运算与查找表向量化加速；
+    支持 contig_whitelist 白名单预过滤以针对性提速；
+    矩阵归一化在 NumPy 层面原地完成，消除 Pandas apply 性能瓶颈。
+
     Parameters
     ----------
-    fasta_file : str or Path
-        输入的 FASTA 格式文件路径（支持 .gz、.bz2、.xz 等压缩格式）。
+    fasta_file : str or Path or file-like
+        输入的 FASTA 格式文件路径（支持 .gz、.bz2、.xz 等压缩格式）或类文件对象。
     length_threshold : int
         序列最小长度阈值，长度小于该值的序列将被忽略。
-    kmer_len : int
-        k-mer 的长度（例如 4）。
+    kmer_len : int, optional
+        k-mer 的长度（默认为 4）。
+    split : bool, optional
+        是否将长序列分割为两段（兼容历史接口，默认为 False）。
+    split_threshold : int, optional
+        当 split=True 时，序列长度达到该阈值才进行分割。
+    contig_whitelist : set or container, optional
+        可选的目标 contig 名称白名单。如果提供，不在白名单中的 contig 将被快速跳过。
 
     Returns
     -------
@@ -65,27 +99,66 @@ def generate_kmer_features_from_fasta(fasta_file, length_threshold, kmer_len):
     """
     # 生成 k-mer 索引映射与特征维度
     kmer_dict, nr_features = generate_feature_mapping(kmer_len)
-    composition = OrderedDict()
-    
-    # 遍历 FASTA 文件中的序列
-    for h, seq in fasta_iter(fasta_file):
-        # 过滤长度小于阈值的序列
+
+    # 若 k=4 则预生成 2-bit 向量化查找表
+    use_fast_4mer = (kmer_len == 4)
+    if use_fast_4mer:
+        byte_map, lut_256 = _build_lut_4mer(kmer_dict)
+
+    if contig_whitelist is not None and not isinstance(contig_whitelist, set):
+        contig_whitelist = set(contig_whitelist)
+
+    def seq_generator():
+        for h, seq in fasta_iter(fasta_file):
+            if contig_whitelist is not None and h not in contig_whitelist:
+                continue
+            if not split:
+                yield h, seq
+            elif len(seq) >= split_threshold:
+                half = len(seq) // 2
+                yield (f'{h}_1', seq[:half])
+                yield (f'{h}_2', seq[half:])
+
+    names = []
+    counts_list = []
+
+    # 遍历 FASTA 序列流
+    for h, seq in seq_generator():
         if len(seq) < length_threshold:
             continue
-        norm_seq = str(seq).upper()
-        # 滑动窗口提取 k-mer 对应的特征索引，忽略含非标准碱基（如 N）的 k-mer
-        kmers = [kmer_dict[norm_seq[i:i+kmer_len]]
-                for i in range(len(norm_seq) - kmer_len + 1)
-                if norm_seq[i:i+kmer_len] in kmer_dict]
-        # 统计各特征索引出现的频次，长度不足 nr_features 则补 0
-        composition[h] = np.bincount(np.array(kmers, dtype=np.int64), minlength=nr_features)
-    
-    # 构建 DataFrame，行索引为 contig 名称
-    df = pd.DataFrame.from_dict(composition, orient='index', dtype=float)
 
-    # 添加伪计数，避免 0 频率
-    df = df.apply(lambda x: x + 1e-5)
-    # 按行归一化，得到频率分布
-    df = df.div(df.sum(axis=1), axis=0)
-    return df
+        if use_fast_4mer:
+            if len(seq) < 4:
+                cnt = np.zeros(nr_features, dtype=np.int64)
+            else:
+                seq_bytes = np.frombuffer(seq.encode('ascii', errors='ignore'), dtype=np.uint8)
+                encoded = byte_map[seq_bytes]
+                b0 = encoded[:-3].astype(np.int32)
+                b1 = encoded[1:-2].astype(np.int32)
+                b2 = encoded[2:-1].astype(np.int32)
+                b3 = encoded[3:].astype(np.int32)
+                # 过滤包含非标准碱基（如 N）的窗口
+                valid = (b0 < 4) & (b1 < 4) & (b2 < 4) & (b3 < 4)
+                kmer_indices = (b0 << 6) | (b1 << 4) | (b2 << 2) | b3
+                feat_ids = lut_256[kmer_indices[valid]]
+                cnt = np.bincount(feat_ids, minlength=nr_features)
+        else:
+            norm_seq = str(seq).upper()
+            kmers = [kmer_dict[norm_seq[i:i+kmer_len]]
+                    for i in range(len(norm_seq) - kmer_len + 1)
+                    if norm_seq[i:i+kmer_len] in kmer_dict]
+            cnt = np.bincount(np.array(kmers, dtype=np.int64), minlength=nr_features)
+
+        names.append(h)
+        counts_list.append(cnt)
+
+    if not names:
+        return pd.DataFrame(columns=range(nr_features), dtype=float)
+
+    # 矢量化添加伪计数并按行归一化
+    matrix = np.array(counts_list, dtype=np.float64)
+    matrix += 1e-5
+    matrix /= matrix.sum(axis=1, keepdims=True)
+
+    return pd.DataFrame(matrix, index=names, dtype=float)
 

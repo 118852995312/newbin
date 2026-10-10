@@ -2,15 +2,16 @@ import os
 import subprocess
 from .atomicwrite import atomic_write
 
-def calculate_coverage(depth_stream, bam_file, must_link_threshold, edge=75, is_combined=False,
+def calculate_coverage(depth_stream, bam_file, edge=75, is_combined=False,
                        contig_threshold=1000, sep=None, sample_contig_threshold=None):
     """
     depth_stream : an iterable like the output of bedtools genomecov
     bam_file : str filename
-    must_link_threshold : int
     edge : int
     is_combined : bool
-
+    contig_threshold : int
+    sep : str or None
+    sample_contig_threshold : dict or None
     """
     import pandas as pd
     import numpy as np
@@ -19,9 +20,6 @@ def calculate_coverage(depth_stream, bam_file, must_link_threshold, edge=75, is_
     contigs = []
     mean_coverage = []
     var = []
-
-    split_contigs = []
-    split_coverage = []
 
     for contig_name, lines in groupby(depth_stream, lambda ell: ell.split('\t', 1)[0]):
         lengths = []
@@ -55,40 +53,23 @@ def calculate_coverage(depth_stream, bam_file, must_link_threshold, edge=75, is_
         var.append(depth_value_.var())
         contigs.append(contig_name)
 
-        if is_combined:
-            if len(depth_value) >= must_link_threshold:
-                middle = len(depth_value_) // 2
-                split_contigs.append(contig_name + '_1')
-                split_contigs.append(contig_name + '_2')
-
-                split_coverage.append(depth_value_[:middle].mean())
-                split_coverage.append(depth_value_[middle:].mean())
-
-    if is_combined:
-        contig_cov = pd.DataFrame(
-                { '{0}_cov'.format(bam_file): mean_coverage,
-                }, index=contigs)
-        split_contig_cov = pd.DataFrame(
-                { '{0}_cov'.format(bam_file): split_coverage,
-                }, index=split_contigs)
-        return contig_cov, split_contig_cov
-    else:
-        return pd.DataFrame({
-            '{0}_mean'.format(bam_file): mean_coverage,
-            '{0}_var'.format(bam_file): var,
-            }, index=contigs), None
+    return pd.DataFrame({
+        f'{bam_file}_mean': mean_coverage,
+        f'{bam_file}_var': var,
+    }, index=contigs)
 
 
-def generate_cov(bam_file: str, bam_index, out, threshold,
+def generate_cov(bam_file: str, bam_index, out,
                  is_combined, contig_threshold, logger, sep = None):
     """
     Call bedtools and generate coverage file
 
     bam_file: bam file used
-    out: output
-    threshold: threshold of contigs that will be binned
+    bam_index: index of bam file
+    out: output directory
     is_combined: if using abundance feature in deep learning. True: use
-    contig_threshold: threshold of contigs for must-link constraints
+    contig_threshold: threshold of contigs that will be binned
+    logger: logger
     sep: separator for multi-sample binning
     """
     import numpy as np
@@ -102,14 +83,13 @@ def generate_cov(bam_file: str, bam_index, out, threshold,
         universal_newlines=True,
         stdout=subprocess.PIPE)
 
-    contig_cov, must_link_contig_cov = calculate_coverage(
-                                    bed_p.stdout,
-                                    bam_file,
-                                    threshold,
-                                    is_combined=is_combined,
-                                    sep=sep,
-                                    contig_threshold=(contig_threshold if sep is None else 1000),
-                                    sample_contig_threshold=(contig_threshold if sep is not None else None))
+    contig_cov = calculate_coverage(
+        bed_p.stdout,
+        bam_file,
+        is_combined=is_combined,
+        sep=sep,
+        contig_threshold=(contig_threshold if sep is None else 1000),
+        sample_contig_threshold=(contig_threshold if sep is not None else None))
 
     if bed_p.wait() != 0:
         raise OSError(f"Failure in running bedtools ({bam_file})")
@@ -118,63 +98,93 @@ def generate_cov(bam_file: str, bam_index, out, threshold,
                         "Please check your input files: SemiBin expects that they are sorted BAM files.")
         raise OSError(f"Running bedtools returned an empty file ({bam_file})")
 
-    contig_cov += 1e-5
-    if not is_combined:
-        with atomic_write(os.path.join(out, '{}_data_cov.csv'.format(bam_name)), overwrite=True) as ofile:
-            contig_cov.to_csv(ofile)
-    else:
-        if sep is None:
-            abun_scale = (contig_cov.mean() / 100).apply(np.ceil) * 100
-            contig_cov = contig_cov.div(abun_scale)
-        with atomic_write(os.path.join(out, f'{bam_name}_data_cov.csv'), overwrite=True) as ofile:
-            contig_cov.to_csv(ofile)
-
-        must_link_contig_cov = must_link_contig_cov.apply(lambda x: x + 1e-5)
-        if sep is None:
-            abun_split_scale = (must_link_contig_cov.mean() / 100).apply(np.ceil) * 100
-            must_link_contig_cov = must_link_contig_cov.div(abun_split_scale)
-
-        with atomic_write(os.path.join(out, f'{bam_name}_data_split_cov.csv'), overwrite=True) as ofile:
-            must_link_contig_cov.to_csv(ofile)
+    with atomic_write(os.path.join(out, f'{bam_name}_data_cov.csv'), overwrite=True) as ofile:
+        contig_cov.to_csv(ofile)
 
     return bam_file
 
-def combine_cov(cov_dir : str, bam_list, is_combined : bool): # bam_list : list[str] does not work on Python 3.7
+def combine_cov(cov_dir : str, bam_list, is_combined : bool = True, eps : float = 1e-5):
     """
-    generate cov/cov_split for every sample in one file
+    Combine coverage files for every BAM and compute level, shape, and log_id features.
 
     Parameters
     ----------
     cov_dir : where coverage files are stored
     bam_list : list of BAM files
-    is_combined : whether to process split files
+    is_combined : bool (kept for signature compatibility)
+    eps : pseudocount for log transformation and dispersion index
 
     Returns
     -------
-    cov : DataFrame
-    split_cov : DataFrame (if is_combined) or None (otherwise)
+    data_cov : DataFrame with shape (N, 2M + 1)
+        Columns:
+          - cov_level: (N, 1) contig global mean log-depth
+          - cov_shape_{sample}: (N, M) relative profile (log_mu - level)
+          - cov_log_id_{sample}: (N, M) log dispersion index log(var / (mu + eps))
     """
     import pandas as pd
+    import numpy as np
 
-    covs = []
-    split_covs = []
+    cov_dfs = []
     for bam_index, bam_file in enumerate(bam_list):
         bam_fname = os.path.split(bam_file)[-1]
-        covs.append(
-                pd.read_csv(f'{cov_dir}/{bam_fname}_{bam_index}_data_cov.csv', index_col=0))
+        cov_dfs.append(
+            pd.read_csv(f'{cov_dir}/{bam_fname}_{bam_index}_data_cov.csv', index_col=0))
 
-        if is_combined:
-            split_covs.append(
-                    pd.read_csv(f'{cov_dir}/{bam_fname}_{bam_index}_data_split_cov.csv', index_col=0))
+    if not cov_dfs:
+        return pd.DataFrame()
 
-    data_cov = pd.concat(covs, axis=1)
+    common_index = cov_dfs[0].index
+    for df in cov_dfs[1:]:
+        common_index = common_index.intersection(df.index)
+
+    mu_list = []
+    var_list = []
+    sample_names = []
+
+    for bam_index, bam_file in enumerate(bam_list):
+        bam_fname = os.path.split(bam_file)[-1]
+        sample_names.append(bam_fname)
+        df = cov_dfs[bam_index].loc[common_index]
+
+        mean_cols = [c for c in df.columns if c.endswith('_mean')]
+        var_cols = [c for c in df.columns if c.endswith('_var')]
+
+        if mean_cols and var_cols:
+            mean_col = mean_cols[0]
+            var_col = var_cols[0]
+        else:
+            mean_col = df.columns[0]
+            var_col = df.columns[1] if len(df.columns) > 1 else df.columns[0]
+
+        mu_list.append(df[mean_col].values.astype(np.float64))
+        var_list.append(df[var_col].values.astype(np.float64))
+
+    # mu and var shapes: (N, M)
+    mu = np.column_stack(mu_list)
+    var = np.column_stack(var_list)
+
+    # 阶段 1: mu -> log_mu -> level + shape
+    log_mu = np.log(mu + eps)
+    level = log_mu.mean(axis=1, keepdims=True)  # (N, 1)
+    shape = log_mu - level                       # (N, M)
+
+    # 阶段 2: var, mu -> Index of Dispersion -> log_id
+    dispersion_index = var / (mu + eps)
+    log_id = np.log(np.clip(dispersion_index, eps, None))  # (N, M)
+
+    # 阶段 3: 拼成输入向量 (N, 2M + 1)
+    features = np.hstack([level, shape, log_id])
+
+    level_cols = ['cov_level']
+    shape_cols = [f'cov_shape_{s}' for s in sample_names]
+    log_id_cols = [f'cov_log_id_{s}' for s in sample_names]
+    all_cols = level_cols + shape_cols + log_id_cols
+
+    data_cov = pd.DataFrame(features, index=common_index, columns=all_cols)
     data_cov.index = data_cov.index.astype(str)
-    if is_combined:
-        data_split_cov = pd.concat(split_covs, axis=1)
-        data_split_cov.index = data_split_cov.index.astype(str)
-    else:
-        data_split_cov = None
-    return data_cov, data_split_cov
+    return data_cov
+
 
 def generate_cov_from_abundances(abundances, output, contig_path, contig_threshold=1000, sep=None, sample_contig_threshold=None):
     import pandas as pd
