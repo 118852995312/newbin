@@ -372,9 +372,11 @@ def generate_sequence_features_single(logger, contig_fasta,
         logger.info('We will only calculate k-mer features.')
 
     logger.debug('Generating k-mer features from FASTA file.')
-    kmer_whole = generate_kmer_features_from_fasta(contig_fasta, binned_length, 4)
+    kmer_whole, contig_lens = generate_kmer_features_from_fasta(
+        contig_fasta, binned_length, 4, return_lengths=True)
 
     if only_kmer:
+        kmer_whole['length'] = kmer_whole.index.map(contig_lens).astype(float)
         with atomic_write(os.path.join(output, 'data.csv'), overwrite=True) as ofile:
             kmer_whole.to_csv(ofile)
         return
@@ -415,6 +417,7 @@ def generate_sequence_features_single(logger, contig_fasta,
     kmer_whole.index = kmer_whole.index.astype(str)
     data = pd.merge(kmer_whole, data_cov, how='inner',
                     left_index=True, right_index=True, sort=False)
+    data['length'] = data.index.map(contig_lens).astype(float)
 
     with atomic_write(os.path.join(output, 'data.csv'), overwrite=True) as ofile:
         data.to_csv(ofile)
@@ -499,13 +502,15 @@ def generate_sequence_features_multi(logger, args):
             part_data.to_csv(os.path.join(output_path, 'data_cov.csv'))
 
             sample_fasta = os.path.join(args.output, f'samples/{sample}.fa')
-            kmer_whole = generate_kmer_features_from_fasta(sample_fasta, binning_threshold[sample], 4)
+            kmer_whole, contig_lens = generate_kmer_features_from_fasta(
+                sample_fasta, binning_threshold[sample], 4, return_lengths=True)
 
             sample_cov = pd.read_csv(os.path.join(output_path, 'data_cov.csv'), index_col=0)
             kmer_whole.index = kmer_whole.index.astype(str)
             sample_cov.index = sample_cov.index.astype(str)
             data = pd.merge(kmer_whole, sample_cov, how='inner',
                             left_index=True, right_index=True, sort=False)
+            data['length'] = data.index.map(contig_lens).astype(float)
 
             with atomic_write(os.path.join(output_path, 'data.csv'), overwrite=True) as ofile:
                 data.to_csv(ofile)
@@ -536,11 +541,12 @@ def generate_sequence_features_multi(logger, args):
             part_data.to_csv(os.path.join(output_path, 'data_cov.csv'))
 
             sample_fasta = os.path.join(args.output, f'samples/{sample}.fa')
-            kmer_whole = generate_kmer_features_from_fasta(
-                sample_fasta, binning_threshold[sample], 4)
+            kmer_whole, contig_lens = generate_kmer_features_from_fasta(
+                sample_fasta, binning_threshold[sample], 4, return_lengths=True)
 
             data = pd.merge(kmer_whole, part_data, how='inner',
                             left_index=True, right_index=True, sort=False)
+            data['length'] = data.index.map(contig_lens).astype(float)
 
             with atomic_write(os.path.join(output_path, 'data.csv'), overwrite=True) as ofile:
                 data.to_csv(ofile)

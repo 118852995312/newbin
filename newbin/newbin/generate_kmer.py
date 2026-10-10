@@ -65,7 +65,8 @@ def generate_kmer_features_from_fasta(
         kmer_len=4,
         split=False,
         split_threshold=0,
-        contig_whitelist=None):
+        contig_whitelist=None,
+        return_lengths=False):
     """
     从 FASTA 文件中提取每条序列的归一化 k-mer 频率特征。
 
@@ -90,12 +91,15 @@ def generate_kmer_features_from_fasta(
         当 split=True 时，序列长度达到该阈值才进行分割。
     contig_whitelist : set or container, optional
         可选的目标 contig 名称白名单。如果提供，不在白名单中的 contig 将被快速跳过。
+    return_lengths : bool, optional
+        是否同时返回序列长度字典 {contig_name: length}（默认为 False）。
 
     Returns
     -------
-    df : pandas.DataFrame
+    df : pandas.DataFrame (当 return_lengths=False 时)
         归一化后的 k-mer 频率特征表。
-        行索引（index）为序列 ID / contig 名称，列为特征索引，取值为归一化后的频率（浮点型）。
+    (df, contig_lens) : tuple (当 return_lengths=True 时)
+        包含特征表与序列长度字典的元组。
     """
     # 生成 k-mer 索引映射与特征维度
     kmer_dict, nr_features = generate_feature_mapping(kmer_len)
@@ -121,14 +125,16 @@ def generate_kmer_features_from_fasta(
 
     names = []
     counts_list = []
+    lengths_list = []
 
     # 遍历 FASTA 序列流
     for h, seq in seq_generator():
-        if len(seq) < length_threshold:
+        seq_len = len(seq)
+        if seq_len < length_threshold:
             continue
 
         if use_fast_4mer:
-            if len(seq) < 4:
+            if seq_len < 4:
                 cnt = np.zeros(nr_features, dtype=np.int64)
             else:
                 seq_bytes = np.frombuffer(seq.encode('ascii', errors='ignore'), dtype=np.uint8)
@@ -151,14 +157,19 @@ def generate_kmer_features_from_fasta(
 
         names.append(h)
         counts_list.append(cnt)
+        lengths_list.append(seq_len)
 
     if not names:
-        return pd.DataFrame(columns=range(nr_features), dtype=float)
+        empty_df = pd.DataFrame(columns=range(nr_features), dtype=float)
+        return (empty_df, {}) if return_lengths else empty_df
 
     # 矢量化添加伪计数并按行归一化
     matrix = np.array(counts_list, dtype=np.float64)
     matrix += 1e-5
     matrix /= matrix.sum(axis=1, keepdims=True)
 
-    return pd.DataFrame(matrix, index=names, dtype=float)
+    df = pd.DataFrame(matrix, index=names, dtype=float)
+    if return_lengths:
+        return df, dict(zip(names, lengths_list))
+    return df
 
