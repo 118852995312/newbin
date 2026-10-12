@@ -40,3 +40,6 @@ venv.bak/
 .idea/
 .DS_Store
 Thumbs.db
+
+# Debug outputs
+debug_output/
