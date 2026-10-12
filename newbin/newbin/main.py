@@ -183,6 +183,47 @@ def _add_binning_args(p):
                    help='Maximum proportion of nodes retained in graph sparsification.',
                    dest='max_node',
                    default=1.0)
+    p.add_argument('--k-neighbors',
+                   required=False,
+                   type=int,
+                   help='Number of nearest neighbors in k-NN semantic backbone (default 15).',
+                   dest='k_neighbors',
+                   default=15)
+    p.add_argument('--pe-min-count',
+                   required=False,
+                   type=int,
+                   help='Minimum bridging PE reads threshold theta (default 3).',
+                   dest='pe_min_count',
+                   default=3)
+    p.add_argument('--pe-alpha',
+                   required=False,
+                   type=float,
+                   help='Base confidence weight for physical PE edges (default 0.9).',
+                   dest='pe_alpha',
+                   default=0.9)
+    p.add_argument('--pe-theta',
+                   required=False,
+                   type=float,
+                   help='Nonlinear saturation scale for physical PE edges (default 3.0).',
+                   dest='pe_theta',
+                   default=3.0)
+    p.add_argument('--leiden-resolution',
+                   required=False,
+                   type=float,
+                   help='Resolution parameter for Leiden community detection (default 1.0).',
+                   dest='leiden_resolution',
+                   default=1.0)
+    p.add_argument('--pe-min-mapq',
+                   required=False,
+                   type=int,
+                   help='Minimum mapping quality (MAPQ) for PE reads (default 20).',
+                   dest='pe_min_mapq',
+                   default=20)
+    p.add_argument('--pe-links',
+                   required=False,
+                   help='Path to precomputed PE bridging links CSV file.',
+                   dest='pe_links',
+                   default=None)
     p.add_argument('--minfasta-kb',
                    required=False,
                    type=int,
@@ -258,6 +299,24 @@ def _add_training_args(p):
                    help='Path(s) to data_split.csv file(s).',
                    dest='data_split',
                    default=None)
+    p.add_argument('--must-link',
+                   required=False,
+                   nargs='*',
+                   help='Path(s) to must_link.csv constraint file(s).',
+                   dest='must_link',
+                   default=None)
+    p.add_argument('--cannot-link',
+                   required=False,
+                   nargs='*',
+                   help='Path(s) to cannot_link.csv constraint file(s).',
+                   dest='cannot_link',
+                   default=None)
+    p.add_argument('--loss-type',
+                   required=False,
+                   choices=['hinge', 'supcon'],
+                   help='Main loss function type (hinge or supcon).',
+                   dest='loss_type',
+                   default='hinge')
 
 
 def _add_feature_args(p):
@@ -561,33 +620,31 @@ def generate_sequence_features_multi(logger, args):
 def training(logger, data, data_split, *, output, device, mode, args):
     """
     Train the NewBin model and save to output/model.pt.
-
-    is_combined is inferred from the last column name of data.csv:
-      - ends with '_var'  → is_combined=False (single BAM mode)
-      - otherwise         → is_combined=True  (multi-BAM mode)
     """
     from .model import train_model
-    import pandas as pd
+
+    must_link = getattr(args, 'must_link', None) or data_split
+    cannot_link = getattr(args, 'cannot_link', None)
+    loss_type = getattr(args, 'loss_type', 'hinge')
+    model_path = os.path.join(output, 'model.pt')
 
     if mode == 'single':
         logger.info('Start training from a single sample.')
-        data_ = pd.read_csv(data[0], index_col=0)
-        col_name = data_.columns[-1].split('_')[-1]
-        is_combined = col_name != 'var'
     else:
         logger.info('Start training from multiple samples.')
-        is_combined = False
 
-    model = train_model(logger,
-                        data,
-                        data_split,
-                        is_combined,
-                        args.batchsize,
-                        args.epochs,
-                        device,
-                        args.num_process,
-                        mode)
-    model.save_with_params_to(os.path.join(output, 'model.pt'))
+    model = train_model(logger=logger,
+                        data=data,
+                        must_link=must_link,
+                        cannot_link=cannot_link,
+                        batchsize=args.batchsize,
+                        epochs=args.epochs,
+                        device=device,
+                        num_process=args.num_process,
+                        mode=mode,
+                        main_loss_type=loss_type,
+                        save_path=model_path)
+    return model
 
 
 # --------------------------------------------------------------------------
@@ -603,7 +660,9 @@ def binning_preprocess(data_path, model_path, device):
     data = pd.read_csv(data_path, index_col=0)
     data.index = data.index.astype(str)
 
-    num_cov = data.shape[1] - 136
+    # 矩阵列数: 136 (k-mer) + (2M + 1) (Coverage) + 1 (length) = 138 + 2M
+    # 若纯 k-mer + length 则为 137 列
+    num_cov = data.shape[1] - 137
     if num_cov > 0:
         is_combined = True
         n_sample = max(1, (num_cov - 1) // 2)

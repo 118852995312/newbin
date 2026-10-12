@@ -60,31 +60,14 @@ def cluster_long_read(logger, model, data, device, is_combined,
     import pandas as pd
     from .utils import norm_abundance
     contig_list = data.index.tolist()
-    if not is_combined:
-        train_data_input = data.values[:, 0:136]
-    else:
-        train_data_input = data.values
-        if norm_abundance(train_data_input):
-            from sklearn.preprocessing import normalize
-            norm = np.sum(train_data_input, axis=0)
-            train_data_input = train_data_input / norm
-            train_data_input = normalize(train_data_input, axis=1, norm='l1')
-
     with torch.no_grad():
         model.eval()
-        x = torch.from_numpy(train_data_input).to(device)
-        embedding = model.embedding(x.float()).detach().cpu().numpy()
+        x = torch.from_numpy(data.values.astype(np.float32)).to(device)
+        embedding = model.embedding(x).detach().cpu().numpy()
 
     length_weight = np.array(
         [len(contig_dict[name]) for name in contig_list])
-
-    if not is_combined:
-        depth = data.values[:, 136:len(data.values[0])].astype(np.float32)
-        mean_index = [2 * temp for temp in range(n_sample)]
-        depth = depth[:, mean_index]
-        embedding_new = np.concatenate((embedding, np.log(np.clip(depth, 1e-6, None))), axis=1)
-    else:
-        embedding_new = embedding
+    embedding_new = embedding
 
     import tempfile
     with tempfile.TemporaryDirectory() as tdir:
