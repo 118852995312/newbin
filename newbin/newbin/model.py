@@ -286,7 +286,53 @@ def sample_balanced_pairs(
     rng: Optional[np.random.Generator] = None
 ) -> Tuple[np.ndarray, np.ndarray]:
     """
-    负采样平衡器：控制每个 Epoch 的正负对比例维持在 1 : neg_ratio。
+    负采样平衡器：以正样本数量 `n_pos` 为基准，控制每个 Epoch 的正负对比例维持在 `1 : neg_ratio`
+    （例如设 `neg_ratio=1` 即为 1:1，默认 `neg_ratio=2` 即为 1:2）。
+
+    一、样本生成的三步流程：
+    ------------------------
+    第一步：确定正样本对 `pos_pairs`（标签 = 1.0）
+      - 情况 A（有外部 `must_pairs` 先验）：直接保留全部 `must_pairs` 作为正样本，数量记为 `n_pos`；
+      - 情况 B（无外部 `must_pairs` 先验）：触发自监督兜底，将每条 Contig 与自身配对 `[[0,0], [1,1], ..., [N-1,N-1]]`。
+        在训练模式 `model.train()` 下，`Dropout(0.2)` 会对同一条 Contig 产生两个随机丢弃 20% 神经元的扰动视图，
+        迫使网络学习将该 Contig 的两个不同扰动视图拉近（SimCLR / SimCSE 范式）。
+      - 随后根据比例计算出目标负样本数量：`n_neg_target = n_pos * neg_ratio`。
+
+    第二步：按目标数量 `n_neg_target` 产生负样本对 `neg_pairs`（标签 = 0.0）
+      - 情况 1（已有 `cannot_pairs` 先验充足，`>= n_neg_target`）：
+        直接从 `cannot_pairs` 中无放回地随机抽取 `n_neg_target` 对；
+      - 情况 2（已有 `cannot_pairs` 不足或为空，`< n_neg_target`）：
+        先把已有的 `cannot_pairs` 全部收下，剩余差额 `needed = n_neg_target - len(cannot_pairs)`
+        通过从全库 N 条 Contig 中随机抽取两条不同的 Contig 补齐。
+
+    第三步：合并正负样本并随机洗牌（Shuffle）
+      - 将正样本对（标签 1.0）与负样本对（标签 0.0）上下拼接，并用 `rng.permutation` 打乱顺序后返回。
+
+    二、核心原理解析：为什么“从全库随机盲抓两条 Contig 当负样本”能生效？
+    ----------------------------------------------------------------------
+    1. 防止模型坍塌（Model Collapse）：
+       如果只有正样本（只教模型把相似 Contig 拉近到距离为 0）而缺少负样本，神经网络会“偷懒”把所有 Contig
+       都映射成同一个点（如全 0 向量），使 Loss 直接归零但完全丧失区分能力。必须有充足的负样本向外推，才能撑开特征空间。
+    2. 概率优势（98% 以上是真负样本）：
+       真实宏基因组样本中通常包含几十到几百种不同微生物（Bins）。假设有 50 个菌种，随机盲抓两条 Contig，
+       它们属于不同菌种（真负样本）的概率高达 98%，碰巧属于同一菌种（假负样本噪声）的概率仅约 2%。
+    3. 三道防线抵消 2% 的偶发假负样本误伤：
+       - 防线一（每轮动态重采样稀释）：在 `train_model` 中，每个 Epoch 都会重新调用本函数摇号生成随机负样本。
+         正样本（Must-link）每轮固定不变、持续将同物种 Contig 拉近；而偶发抽错的假负样本在下一轮就会消失，单次误推会被持续拉力抵消。
+       - 防线二（群体梯度主导）：同物种 Contig 的 k-mer 和丰度天然相似，98% 的真负样本梯度决定了网络权重更新的主方向，
+         极少数假负样本的反向噪声梯度在 Batch 平均时会被直接淹没。
+       - 防线三（双轨共丰度辅助损失兜底）：`MetagenomicPipelineLoss` 中的 `CoAbundanceAuxiliaryLoss` 不依赖此处的 0/1 标签，
+         而是直接计算两条 Contig 跨样本丰度趋势（shape）的余弦相似度，若随机抽到的两条 Contig 丰度高度一致，辅助损失会保护它们不被推远。
+
+    三、代码技巧解析：为什么用“圆盘走步法” `(idx1 + offset) % num_contigs` 抽样？
+    -------------------------------------------------------------------------------
+    为了一次性批量随机抽出两条不同的 Contig，且 100% 保证 `idx1 != idx2`（绝不抽到自己和自己当负样本），
+    避免写低效的 `while idx1 == idx2` 循环重抽：
+      1. 将 `0 ~ N-1` 共 N 条 Contig 想象成一个 N 格的圆形表盘（走到 `N-1` 再走 1 步就回到 `0`，即 `% N` 取余数）；
+      2. `idx1`：先在表盘上随机选一个起点（`0 ~ N-1`）；
+      3. `offset`：随机产生 `1 ~ N-1` 步的顺时针偏移步数（最少走 1 步，最多走 `N-1` 步，绝不原地踏步走 0 步，也绝不走满一圈 N 步）；
+      4. `idx2 = (idx1 + offset) % N`：从起点 `idx1` 走 `offset` 步停下。因为没走满一圈，停下的位置 `idx2` 绝对不等于 `idx1`，
+         且其余 `N-1` 条 Contig 被抽中的概率完全均等（各为 `1 / (N - 1)`）。
 
     Parameters
     ----------
@@ -297,7 +343,7 @@ def sample_balanced_pairs(
     cannot_pairs : list of (int, int)
         清洗后的先验负对（Cannot-link）索引列表
     neg_ratio : int
-        每个正样本对对应的负样本对数量（默认 2，即 1:2）
+        每个正样本对对应的负样本对数量（默认 2 即 1:2；若设为 1 即为 1:1）
     rng : np.random.Generator, optional
         随机数生成器
 
@@ -314,39 +360,52 @@ def sample_balanced_pairs(
     if num_contigs < 2:
         raise ValueError(f"contig 总数必须大于等于 2 才能进行成对训练，当前为 {num_contigs}。")
 
-    # 1. 确定正样本对
+    # -----------------------------------------------------------------------
+    # 第一步: 确定正样本对 pos_pairs (标签 = 1.0)
+    # -----------------------------------------------------------------------
     if len(must_pairs) > 0:
+        # 情况 A: 有外部 Must-link 先验正样本，直接全部采用
         pos_pairs = np.array(must_pairs, dtype=np.int64)
     else:
-        # 自监督兜底机制：若未提供任何外部 Must-link 先验，
-        # 将各 contig 与自身配对作为正样本对。
+        # 情况 B (自监督兜底机制): 若未提供任何外部 Must-link 先验，
+        # 将各 contig 与自身配对 [[0,0], [1,1], ...] 作为正样本对。
         # 在模型训练模式 (model.train) 下，Dropout(0.2) 会对同一特征生成两个不同的扰动视图 (SimCLR/SimCSE 范式)。
         pos_pairs = np.stack([
             np.arange(num_contigs, dtype=np.int64),
             np.arange(num_contigs, dtype=np.int64)
         ], axis=1)
 
+    # 以正样本数 n_pos 为基准，按 1 : neg_ratio 算出需要凑齐的目标负样本数量 n_neg_target
     n_pos = len(pos_pairs)
     n_neg_target = max(1, n_pos * max(1, neg_ratio))
 
-    # 2. 负样本对采样与平衡
+    # -----------------------------------------------------------------------
+    # 第二步: 负样本对采样与平衡 neg_pairs (标签 = 0.0)
+    # -----------------------------------------------------------------------
     if len(cannot_pairs) >= n_neg_target:
-        # 先验负对充足，无放回随机抽取目标数量
+        # 情况 1: 先验负对 (cannot_pairs) 数量充足，直接从中无放回地随机抽取 n_neg_target 对
         chosen_idx = rng.choice(len(cannot_pairs), size=n_neg_target, replace=False)
         neg_pairs = np.array(cannot_pairs, dtype=np.int64)[chosen_idx]
     else:
-        # 先验负对不足或为空，全取已有先验负对，其余用全库随机配对补齐
+        # 情况 2: 先验负对不足或为空 -> 先全盘收下已有的 cannot_pairs，差额部分用全库随机配对补齐
         sampled_prior = [list(p) for p in cannot_pairs]
-        needed = n_neg_target - len(sampled_prior)
+        needed = n_neg_target - len(sampled_prior)  # 还需要随机补齐的负样本对数
+
+        # 圆盘走步法随机抽取 needed 对不同的 Contig，100% 保证 idx1 != idx2：
+        # 1) 在 0 ~ num_contigs-1 中随机抽取第一条 Contig 起点 idx1
         idx1 = rng.choice(num_contigs, size=needed, replace=True)
-        # 错位加偏移量以确保 idx1 != idx2
+        # 2) 随机生成 1 ~ num_contigs-1 的顺时针走步偏移量 offset（绝不走 0 步或满圈 num_contigs 步）
         offset = 1 + rng.choice(num_contigs - 1, size=needed, replace=True)
+        # 3) 起点加偏移量对总数取模，得到绝对不与 idx1 重合的第二条 Contig idx2
         idx2 = (idx1 + offset) % num_contigs
+
         rand_neg = np.stack([idx1, idx2], axis=1).tolist()
         all_neg = sampled_prior + rand_neg
         neg_pairs = np.array(all_neg, dtype=np.int64)
 
-    # 3. 组合正负对并打乱
+    # -----------------------------------------------------------------------
+    # 第三步: 组合正负样本对，打上 1.0 / 0.0 标签并随机洗牌打乱 (Shuffle)
+    # -----------------------------------------------------------------------
     all_pairs = np.concatenate([pos_pairs, neg_pairs], axis=0)
     all_labels = np.concatenate([
         np.ones(len(pos_pairs), dtype=np.float32),

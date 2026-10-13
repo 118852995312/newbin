@@ -14,16 +14,22 @@ NewBin 模型训练与全流程数据调试脚本 (debug_pipeline.py)
 
 import os
 import sys
+import site
 import logging
+
+# 1. 确保能正确引入 newbin 包与本地 .venv 虚拟环境依赖（支持直接在 IDE 点击 Run/Debug 按钮）
+BASE_DIR = os.path.dirname(os.path.abspath(__file__))
+if BASE_DIR not in sys.path:
+    sys.path.insert(0, BASE_DIR)
+
+_venv_site = os.path.join(BASE_DIR, ".venv", "Lib", "site-packages")
+if os.path.isdir(_venv_site) and _venv_site not in sys.path:
+    site.addsitedir(_venv_site)
+
 import numpy as np
 import pandas as pd
 import torch
 from torch.utils.data import DataLoader
-
-# 确保能正确引入 newbin 包
-BASE_DIR = os.path.dirname(os.path.abspath(__file__))
-if BASE_DIR not in sys.path:
-    sys.path.insert(0, BASE_DIR)
 
 from newbin.generate_kmer import generate_kmer_features_from_fasta
 from newbin.cluster import (
@@ -79,6 +85,7 @@ def main():
     print(f"输入 FASTA 文件: {fasta_path}")
 
     # length_threshold 设为 500 bp，保证测试样本都能进入
+    ##kmer_df 为所有contig的kmer计算结果 contig个数*136;contig_lens 为dict 记录contig的name以及length
     kmer_df, contig_lens = generate_kmer_features_from_fasta(
         fasta_path, length_threshold=500, kmer_len=4, return_lengths=True
     )
@@ -95,24 +102,38 @@ def main():
     print("【步骤 2】组装 Coverage 特征与最终 data.csv 矩阵")
     print("-" * 40)
 
-    # 模拟 M=2 个测序样本的 Coverage 特征: [level(1), shape(2), log_id(2)] = 5 维
-    # (真实场景由 generate_coverage.py 从 BAM 计算产生)
+    # -------------------------------------------------------------------------
+    # 说明：在正式生产流程 (generate_coverage.py) 中分为三步：
+    #   - 第一步 (generate_cov)      : 调用外部 Linux 工具 bedtools 扫描 BAM 文件数层数；
+    #   - 第二步 (calculate_coverage): 掐头去尾 75bp，算出每条 Contig 在单样本下的均值 μ 和方差 var；
+    #   - 第三步 (combine_cov)       : 汇总 M 个样本的 (μ, var)，合成 (2M+1) 维特征表 data_cov。
+    # 因 Windows 本地无 bedtools，此处模拟第一步和第二步产出的均值 μ，然后严格按第三步 combine_cov 的公式计算。
+    # -------------------------------------------------------------------------
     np.random.seed(42)
-    N = len(kmer_df)
-    M = 2
+    N = len(kmer_df)  # Contig 总数 (40)
+    M = 2             # 测序样本数 (模拟 2 个样本 s1, s2)
+
+    # 模拟第一步 & 第二步产出的单样本平均测序深度矩阵 μ，形状 (N, M) = (40, 2)
     mu_sim = np.random.uniform(5.0, 100.0, size=(N, M))
-    log_mu = np.log(mu_sim + 1e-5)
+    log_mu = np.log(mu_sim + 1e-5)                       # 加伪计数取自然对数 ln(μ)
+
+    # 对应 combine_cov() 的三个核心特征分量（共 1 + M + M = 2M + 1 列）：
+    # 1. level (1列, 形状 40×1): 跨样本平均对数深度，反映该 Contig 整体丰度高低
     level = log_mu.mean(axis=1, keepdims=True)
+    # 2. shape (M列, 形状 40×2): 减去自身均值后的跨样本相对涨落剖面（每行和恒为 0，用于计算辅助损失 L_co 的 r_ij）
     shape = log_mu - level
+    # 3. log_id (M列, 形状 40×2): 对数离散指数 ln(var / (mu + eps))，反映单条 Contig 内部覆盖均匀度
     log_id = np.random.uniform(-1.0, 1.0, size=(N, M))
 
+    # cov_df 完全等价于正式流程中 generate_coverage.combine_cov() 的返回值 data_cov
+    # 形状为 (N, 2M + 1) = (40, 5)，列顺序严格固定为: [1列 cov_level, M列 cov_shape, M列 cov_log_id]
     cov_df = pd.DataFrame(
         np.hstack([level, shape, log_id]),
         index=kmer_df.index,
         columns=['cov_level', 'cov_shape_s1', 'cov_shape_s2', 'cov_log_id_s1', 'cov_log_id_s2']
     )
 
-    # 拼接: k-mer (136) + Coverage (5) + length (1) = 142 维
+    # 对应 main.py 中的总表拼接：将 [k-mer (前136列) + Coverage (中间2M+1=5列) + length (最后1列)] 拼成 142 维总表
     full_data = pd.concat([kmer_df, cov_df], axis=1)
     full_data['length'] = full_data.index.map(contig_lens).astype(float)
 
@@ -127,7 +148,27 @@ def main():
     print(f"[OK] 已持久化至: {data_csv_path}")
 
     # -------------------------------------------------------------------------
-    # 步骤 3: 从 BAM 文件流式提取成对 Reads 跨 Contig 连接 (PE Links)
+    # 步骤 3: 从 BAM 文件流式提取成对 Reads 跨 Contig 连接 (PE Bridging Links)
+    # -------------------------------------------------------------------------
+    # 一、BAM 文件是什么（它与 Contig 的上下游关系）：
+    #   1. 拼接前 (.fastq) : 测序仪产出成对的原始短序列 Reads (R1/R2，约 150bp)；
+    #   2. 拼接后 (.fasta) : 组装软件将重叠的 Reads 拼成长序列 Contig（几千~几万 bp）；
+    #   3. 回贴生成 (.bam) : 把第 1 步的原始 Reads 重新贴回第 2 步的 Contig 上，生成此处的 .bam 文件
+    #                        （与【步骤 2】算 Coverage 用的是同一个 BAM 文件，一物两用）。
+    #
+    # 二、BAM 文件记录的数据格式：
+    #   - 文件头 (Header)          : 存有所有 Contig 名称列表 `refs = ['g1k_0', 'g1k_1', ...]`；
+    #   - 比对记录 (Alignment Rec) : 每一条记录代表一条 Read，明确记录了：
+    #       * RNAME (refID)      : 当前这端 Read 贴到了哪条 Contig 上（例如 'g1k_0'）
+    #       * RNEXT (next_refID) : 配对的另一端 Mate Read 贴到了哪条 Contig 上（例如 'g1k_1'）
+    #       * MAPQ / FLAG        : 比对质量分数与比对状态标记
+    #
+    # 三、跨 Contig 搭桥判定：
+    #   - 当 RNAME != RNEXT 且比对质量 MAPQ >= min_mapq 时，说明同一根 DNA 碎片的两端分别贴在了两条不同的 Contig 上，
+    #     这是两条 Contig 来自同一物种基因组的直接物理铁证；
+    #   - 返回值 pe_counts 为字典 Counter: {('contig_A', 'contig_B'): 共享的配对reads数}，
+    #     将在【步骤 6】传入 build_dual_track_graph()，通过 w_pe = α * tanh(count / θ) 补强聚类图边权。
+    #     (注：测试集 sample.sorted.bam 中模拟 reads 均在同一 Contig 内，故此处计数为 0)
     # -------------------------------------------------------------------------
     print("\n" + "-" * 40)
     print("【步骤 3】从 BAM 文件解析成对 Reads 跨 Contig 物理连接")
@@ -229,7 +270,7 @@ def main():
             d_shape1 = extract_shape_features(b_x1)
             d_shape2 = extract_shape_features(b_x2)
 
-            # 2. 孪生前向传播，同时返回最终 z 与 Coverage z_c
+            # 2. 孪生前向传播，同时返回最终 z(kmer和converage通过神经网络融合后的结果) 与 Coverage z_c（融合前的converage的输出）
             (z1, z2), (zc1, zc2) = model(b_x1, b_x2, return_zc=True)
 
             # 3. 计算双轨损失

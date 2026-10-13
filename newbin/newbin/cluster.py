@@ -65,10 +65,67 @@ def cal_kl(m, v, use_ne='auto'):
 
 def parse_bam_pe_reads_stream(bam_path: str, min_mapq: int = 20):
     """
-    流式读取 BAM 文件，提取跨 contig 的配对读段 (RNAME, RNEXT)。
-    双引擎设计：
-    1. 优先使用系统 samtools view (流式、高效)；
-    2. 无外部命令时使用内置纯 Python BGZF 解压与 BAM 二进制解析兜底。
+    【一句话总结】：
+    像安检扫描仪一样，从头到尾流式扫描一个 `.bam` 文件里的所有 Read，专门挑出
+    “一头贴在 Contig A、另一头贴在 Contig B”的跨 Contig 配对 Reads (PE Bridging Reads)，
+    并统计每一对 `(Contig A, Contig B)` 一共被连了多少次。
+
+    一、BAM 文件的来源与上下游关系（为什么它是 Contig 的前一步数据）：
+    ------------------------------------------------------------------
+    1. 原始测序 (.fastq) : 测序仪打碎 DNA（约 300~500bp 片段），测出两端各 150bp 的成对短序列 Reads (R1/R2)，
+                           这是拼接 Contig 前最原始的测序数据；
+    2. 序列拼接 (.fasta) : 组装软件将重叠的 Reads 拼接成较长的 Contig 序列（若中间空白区未知则被迫断开成两条 Contig）；
+    3. 回贴比对 (.bam)   : 将第 1 步的原始 Reads 重新比对（Mapping）回第 2 步拼好的 Contig 上，
+                           生成本函数输入的 `.bam` 文件（与 Step 2 计算 Coverage 丰度使用的是同一个 BAM 文件，一物两用）。
+                           因此，BAM 文件既保留了拼接前的原始配对 Reads，又记录了每条 Read 最终归属的 Contig 名称！
+
+    二、BAM 文件内部记录的数据格式：
+    --------------------------------
+    BAM 是 SAM 比对格式的二进制压缩版（BGZF），内部包含两部分核心数据：
+    1. 文件头 (Header) —— Contig 名称字典 (`refs`)：
+       - 记录所有 Contig 的名称列表，例如 `refs = ['g1k_0', 'g1k_1', 'g1k_2', ...]`，将整数编号 `refID` 映射为 Contig 名。
+    2. 比对记录列表 (Alignment Records) —— 每条 Read 的归属信息：
+       每一行（或每条二进制记录）代表一条短读段 Read，核心字段包括：
+       - `QNAME`              : 这条 Read 的名称（配对的左端 R1 和右端 R2 拥有相同的 QNAME）
+       - `FLAG` (`flag`)      : 比对状态标记位（如 0x4 表示未比对上，0x100/0x800 表示次级/补充比对）
+       - `RNAME` (`refID`)    : ★ 当前这条 Read 比对到的目标 Contig 名称（例如 `'g1k_0'`）
+       - `MAPQ` (`mapq`)      : 比对质量打分（分数越高，说明这条 Read 贴到该 Contig 的可信度越高）
+       - `RNEXT` (`next_refID`): ★ 与当前 Read 配对的另一端 Mate Read 比对到的目标 Contig 名称（例如 `'g1k_1'`）
+
+    三、函数内部是怎么一步步工作的（双引擎设计）：
+    ----------------------------------------------
+    代码会自动检测环境，从两条做同一件事的路线中二选一执行：
+    1. 路线 1（引擎一，优先）：若系统装有 `samtools`，调用 `samtools view -F 0x904 -q min_mapq` 将二进制 BAM
+       转为按制表符分隔的文本流，逐行提取第 3 列 `rname` 和第 7 列 `rnext`：
+       - 若 `rnext == '='`（两端在同一条 Contig 上，占 99% 以上情况）或 `rnext == '*'`（另一端未贴上） -> 直接跳过；
+       - 若 `rnext != rname`，说明抓到一次跨 Contig 搭桥 -> 排序为无向对 `(contig_A, contig_B)` 并计数 +1。
+    2. 路线 2（引擎二，兜底）：若在 Windows 等未安装 `samtools` 的环境下，自动使用内置纯 Python 二进制解析（分 3 步）：
+       - 第 1 步 `_get_blocks()` : 流式分块读取并解压 BAM 的 BGZF 压缩块（随读随解压，哪怕几十 GB 的 BAM 也不会撑爆内存）；
+       - 第 2 步 步骤 A (读文件头): 从开头解析出 Contig 数量 `n_ref`，构建编号到名称的列表 `refs = ['g1k_0', 'g1k_1', ...]`；
+       - 第 3 步 步骤 B (读记录)  : 循环解包每条 Read 记录的前 24 个字节，拿出 `refID`、`next_refID`、`mapq`、`flag`，
+                                   当质量达标、主比对正常且 `next_refID != refID` 时，用 `refs[refID]` 和 `refs[next_refID]`
+                                   查表还原出两条 Contig 的名称并计数 +1。
+
+    四、算出来的返回结果 `counts` 在后续流程中有什么用？
+    ----------------------------------------------------
+    1. 给神经网络当“标准答案”（Must-Link 正样本对）：
+       在训练阶段（Step 4 & Step 5），被多条配对 Reads 连接的两条 Contig 会作为正样本对，引导神经网络将它们的特征向量拉近。
+    2. 在最终聚类图上“焊死”物理强边（Step 6）：
+       在构建双轨 KNN 图进行 Leiden 聚类时，直接在这两条 Contig 之间加上高权重的物理边 `w_pe = α * tanh(count / θ)`，
+       确保它们被划分进同一个菌株（Bin）中。
+
+    Parameters
+    ----------
+    bam_path : str
+        单个样本的 `.bam` 比对文件路径（与 Step 2 计算 Coverage 传入的 BAM 文件相同）。
+    min_mapq : int, default=20
+        最小比对质量阈值，过滤掉贴得模棱两可、可能贴错位置的劣质 Read。
+
+    Returns
+    -------
+    counts : collections.Counter
+        键为按字母排序的 Contig 名称二元组 `(contig_1, contig_2)`，值为跨序列配对 Reads 的计数。
+        示例: `Counter({('g1k_0', 'g1k_1'): 15, ('g1k_3', 'g1k_8'): 6})`
     """
     import subprocess
     from collections import Counter
@@ -78,7 +135,11 @@ def parse_bam_pe_reads_stream(bam_path: str, min_mapq: int = 20):
 
     counts = Counter()
 
-    # 1. 尝试使用 samtools view
+    # -----------------------------------------------------------------------
+    # 路线 1 (引擎 1): 优先尝试调用系统 samtools view (流式文本解析)
+    #   -F 0x904 : 过滤掉未比对上 (0x4)、次级比对 (0x100) 和补充比对 (0x800) 的记录
+    #   -q       : 要求最小比对质量分数 MAPQ >= min_mapq
+    # -----------------------------------------------------------------------
     if shutil.which('samtools'):
         cmd = ['samtools', 'view', '-F', '0x904', '-q', str(min_mapq), bam_path]
         try:
@@ -87,20 +148,27 @@ def parse_bam_pe_reads_stream(bam_path: str, min_mapq: int = 20):
                     cols = line.strip().split('\t')
                     if len(cols) < 7:
                         continue
-                    rname = cols[2]
-                    rnext = cols[6]
+                    rname = cols[2]  # 第 3 列 (RNAME): 当前这端 Read 贴在哪个 Contig 上 (如 'g1k_0')
+                    rnext = cols[6]  # 第 7 列 (RNEXT): 配对的另一端 Read 贴在哪个 Contig 上 (如 'g1k_1'、'=' 或 '*')
+                    # '=' 表示两端贴在同一条 Contig 上（绝大多数情况），跳过；
+                    # '*' 表示配对的另一端根本没比对上任何 Contig，跳过；
+                    # 只有当 rnext 是另一个不同的 Contig 名字时，才说明抓到了一条跨 Contig 搭桥！
                     if rnext != '=' and rnext != '*' and rnext != rname:
+                        # 用 sorted 排序，确保 ('g1k_0', 'g1k_1') 和 ('g1k_1', 'g1k_0') 归为同一个无向对
                         pair = tuple(sorted([rname, rnext]))
                         counts[pair] += 1
                 return counts
         except Exception:
             pass
 
-    # 2. 内置纯 Python BGZF 流式二进制解析兜底
+    # -----------------------------------------------------------------------
+    # 路线 2 (引擎 2): 内置纯 Python BGZF 流式二进制解析兜底（Windows 等无 samtools 环境自动走这里）
+    # -----------------------------------------------------------------------
     try:
         with open(bam_path, 'rb') as f:
             buf = bytearray()
 
+            # 第 1 步: 流式分块解压 BAM 的 BGZF (分块 Gzip) 压缩数据块，随用随取，避免大文件撑爆内存
             def _get_blocks():
                 while True:
                     hdr = f.read(18)
@@ -112,7 +180,10 @@ def parse_bam_pe_reads_stream(bam_path: str, min_mapq: int = 20):
 
             gen = _get_blocks()
 
-            # 解析 BAM Header
+            # 第 2 步 (步骤 A): 解析 BAM 文件头 (Header)，构建 Contig 编号映射表 refs
+            #   二进制 BAM 为了节省体积，不在每条 Read 里重复存 Contig 字符串，而是存整数下标 refID。
+            #   这里先把所有 Contig 的名字按顺序读进列表 refs = ['g1k_0', 'g1k_1', ...]，
+            #   后续通过 refs[refID] 即可查表还原出对应的 Contig 名称。
             while len(buf) < 8:
                 buf.extend(next(gen))
             l_text = struct.unpack('<I', buf[4:8])[0]
@@ -130,11 +201,16 @@ def parse_bam_pe_reads_stream(bam_path: str, min_mapq: int = 20):
                 while len(buf) < pos + l_name + 4:
                     buf.extend(next(gen))
                 name = buf[pos:pos+l_name-1].decode('utf-8', errors='ignore')
-                pos += l_name + 4  # 跳过 l_ref
+                pos += l_name + 4  # 跳过 l_ref (该 Contig 的序列长度)
                 refs.append(name)
             buf = buf[pos:]
 
-            # 流式解析比对记录
+            # 第 3 步 (步骤 B): 逐条解析 BAM 二进制比对记录 (Alignment Records)
+            #   每条 Read 的核心比对信息都在记录开头的前 24 个字节里，通过 struct.unpack 拆出 4 个关键数字：
+            #   - refID      : 当前 Read 所属 Contig 的编号 (如 0) -> 查表 refs[refID] 得 Contig 名
+            #   - next_refID : 配对 Read 所属 Contig 的编号 (如 1) -> 查表 refs[next_refID] 得 Contig 名
+            #   - mapq       : 比对质量分数 (要求 >= min_mapq)
+            #   - flag       : 状态标记位 (要求 (flag & 0x904) == 0，即主比对且成功比对上)
             for block in gen:
                 buf.extend(block)
                 while len(buf) >= 4:
@@ -145,12 +221,16 @@ def parse_bam_pe_reads_stream(bam_path: str, min_mapq: int = 20):
                     buf = buf[4+bsize:]
                     if len(rec) < 24:
                         continue
+                    # 解包比对记录前 24 字节：提取当前 Contig 编号 refID、质量 mapq、标记位 flag、配对端 Contig 编号 next_refID
                     refID, _, _, mapq, _, _, flag, _, next_refID = struct.unpack('<iiBBHHHii', rec[:24])
+                    # 校验质量合格、主比对记录，且两端贴在不同的 Contig 上 (next_refID != refID)
                     if mapq >= min_mapq and (flag & 0x904) == 0:
                         if 0 <= next_refID < len(refs) and 0 <= refID < len(refs) and next_refID != refID:
+                            # 查表还原成 Contig 名字并按字母排序，给该无向 Contig 对计数 +1
                             pair = tuple(sorted([refs[refID], refs[next_refID]]))
                             counts[pair] += 1
 
+            # 处理解压缓冲区中最后剩余的比对记录（逻辑同上）
             while len(buf) >= 4:
                 bsize = struct.unpack('<I', buf[:4])[0]
                 if len(buf) < 4 + bsize:
@@ -286,6 +366,59 @@ def build_dual_track_graph(
 ):
     """
     构建双轨增强图 (k-NN 全局语义骨架 + 成对 Reads 局部物理连通补强)。
+
+    一、参数 `k_neighbors` 的核心作用与原理：
+    -------------------------------------------
+    1. 什么是 `k_neighbors`（默认值 15）：
+       规定在 100 维 Embedding 特征空间中，每条 Contig 只跟与自己特征最相似的前 k 个“最亲密邻居”连线，
+       用来构建一张稀疏的 k-NN 邻近图。
+
+    2. 为什么必须限制 k 值（若不限制会有什么灾难）：
+       - 避免内存爆炸 (OOM)：真实宏基因组往往有数万（如 50,000）条 Contig，若两两全连接，边数高达
+         50000 * 49999 / 2 ≈ 12.5 亿条边，内存直接被撑爆；
+       - 形成清晰的物种边界：同物种 Contig 互为前 k 个最近邻自然抱团成簇；若全连接，不同物种间也会连满
+         微弱噪声边，导致整个图变成“一锅粥”，下游 Leiden 聚类算法将完全无法切分出菌株边界。
+
+    3. 调参直觉与 trade-off：
+       - k 设得太小（如 k=2~3）：图过于稀疏，同物种 Contig 容易断开，导致 Bin 被打得过于零碎（分箱过度碎片化）；
+       - k 设得太大（如 k=50~100）：图过于密集，容易引入跨物种的弱相似虚假边，导致不同细菌被混在一起（污染率 Contamination 飙升）；
+       - 默认值 15：宏基因组图分箱（包括 SemiBin 等）公认的黄金经验值，兼顾连通性与高纯度。
+
+    4. 代码细节：为什么代码中用 `actual_k = min(k_neighbors + 1, num_contigs)`？
+       因为在特征空间计算近邻时，距离最近的第 1 名永远是 Contig 自身（距离为 0）。所以必须多取 1 个名额，
+       把第 1 名（自己）跳过后，剩下的恰好是前 k 个不重复的邻居。
+
+    二、双轨图的图层融合逻辑：
+    --------------------------
+    - 轨道 1 (语义骨架): 基于 100 维 Embedding 的余弦相似度构建 k-NN 边，边权为 cos_sim ∈ [0, 1]；
+    - 轨道 2 (物理增强): 将 BAM 中提取的跨 Contig PE Reads 计数 count 通过平滑饱和函数
+                         w_pe = α * tanh(count / θ) 注入为强物理边；
+    - 约束剪枝 (Cannot-link): 强制删除先验互斥对之间的连边，防止不同物种被错误聚到同一个 Bin。
+
+    Parameters
+    ----------
+    embedding : np.ndarray, shape (N, 100)
+        全体 Contig 的 100 维特征向量矩阵
+    contig_names : list of str
+        Contig 名称列表
+    pe_links : dict, optional
+        跨 Contig 配对 Reads 计数字典 {('contig_A', 'contig_B'): count}
+    k_neighbors : int, default=15
+        每个节点连向的最相似邻居数量（控制图稀疏度）
+    pe_alpha : float, default=0.9
+        物理边权重上限饱和系数
+    pe_theta : float, default=3.0
+        物理边权重饱和速度缩放参数
+    cannot_pairs : list of (str, str), optional
+        先验不能连的 Contig 名称对
+    logger : logging.Logger, optional
+
+    Returns
+    -------
+    g : igraph.Graph
+        构建完成的双轨增强无向图
+    weights : np.ndarray, dtype=np.float32
+        图上每条边对应的权重数组 (取值范围 0~1)
     """
     from sklearn.neighbors import NearestNeighbors
     from igraph import Graph
@@ -298,24 +431,38 @@ def build_dual_track_graph(
         g = Graph(n=num_contigs)
         return g, np.array([], dtype=np.float32)
 
-    # 1. 全局语义骨架 (k-NN 图)
+    # -----------------------------------------------------------------------
+    # 轨道 1: 全局语义骨架 (基于特征余弦相似度的 k-NN 图)
+    # -----------------------------------------------------------------------
+    # L2 归一化特征向量，使欧氏空间点积等价于余弦相似度
     norms = np.linalg.norm(embedding, axis=1, keepdims=True)
     norms[norms == 0] = 1.0
     norm_emb = embedding / norms
 
+    # 取 k_neighbors + 1 个近邻（因为包含自身，自身排在第 1 位）
     actual_k = min(k_neighbors + 1, num_contigs)
+
+    # -----------------------------------------------------------------------
+    # 无监督 KNN 最近邻搜索（类似“地图搜附近”的三步过程，非模型训练）：
+    #   1. NearestNeighbors(...) : 配置搜索规则（按余弦距离 metric='cosine' 找最近的 actual_k 个点）；
+    #   2. nn.fit(norm_emb)      : 将全体 Contig 的 100 维特征坐标导入并保存在底库中（只存坐标做索引，无参数训练）；
+    #   3. nn.kneighbors(...)    : 正式查询，输出 indices (邻居编号, shape [N, actual_k]) 与 distances (余弦距离)。
+    # -----------------------------------------------------------------------
     nn = NearestNeighbors(n_neighbors=actual_k, metric='cosine')
-    nn.fit(norm_emb)
-    distances, indices = nn.kneighbors(norm_emb)
+    nn.fit(norm_emb)  # 将所有 Contig 坐标存入搜索底库
+    distances, indices = nn.kneighbors(norm_emb)  # 查出每条 Contig 最近的 actual_k 个邻居与距离
 
     edge_dict = {}
 
     for i in range(num_contigs):
         for dist, j in zip(distances[i], indices[i]):
+            # 排除自身到自身的自环边 (i == j)
             if i == j:
                 continue
+            # 余弦距离转为余弦相似度：cos_sim = 1 - cosine_distance
             cos_sim = max(0.0, float(1.0 - dist))
             pair = tuple(sorted([i, j]))
+            # 若两个方向都检索到了对方，保留最大的相似度作为无向边权重
             if pair not in edge_dict or cos_sim > edge_dict[pair]:
                 edge_dict[pair] = cos_sim
 
