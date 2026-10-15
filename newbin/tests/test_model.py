@@ -287,8 +287,40 @@ class TestNewBinModel(unittest.TestCase):
                 1,
                 'single'
             )
-            self.assertIsNotNone(model)
+    def test_l2_norm_toggle_and_serialization(self):
+        """测试模型 L2 超球面归一化开关与模型序列化保存恢复"""
+        num_features = 137
+        x = torch.rand(4, num_features) * 10.0
+
+        # 1. 超球面体系: l2_norm=True
+        model_norm = NewBinModel(num_features=num_features, l2_norm=True)
+        model_norm.eval()
+        with torch.no_grad():
+            emb_norm = model_norm.embedding(x)
+        norms = torch.norm(emb_norm, p=2, dim=-1)
+        self.assertTrue(torch.allclose(norms, torch.ones_like(norms), atol=1e-5))
+
+        # 2. 自由欧氏体系: l2_norm=False
+        model_free = NewBinModel(num_features=num_features, l2_norm=False)
+        model_free.eval()
+        with torch.no_grad():
+            emb_free = model_free.embedding(x)
+        norms_free = torch.norm(emb_free, p=2, dim=-1)
+        # 自由欧氏向量的模长不全为 1.0
+        self.assertFalse(torch.allclose(norms_free, torch.ones_like(norms_free), atol=1e-3))
+
+        # 3. 序列化与反序列化测试
+        with tempfile.TemporaryDirectory() as tmpdir:
+            save_path = os.path.join(tmpdir, "model_free.pt")
+            model_free.save_with_params_to(save_path)
+
+            loaded_model = model_load(save_path, device=torch.device('cpu'))
+            self.assertFalse(loaded_model.l2_norm)
+            with torch.no_grad():
+                loaded_emb = loaded_model.embedding(x)
+            self.assertTrue(torch.allclose(emb_free, loaded_emb, atol=1e-5))
 
 
 if __name__ == '__main__':
     unittest.main()
+

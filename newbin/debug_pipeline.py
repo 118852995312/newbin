@@ -198,119 +198,138 @@ def main():
     # -------------------------------------------------------------------------
     # 步骤 5: 模型初始化、前向传播与双轨损失计算
     # -------------------------------------------------------------------------
+    # 步骤 5: 模型网络搭建与双体系对比训练循环 (5 个 Epoch)
+    # -------------------------------------------------------------------------
     print("\n" + "-" * 40)
-    print("【步骤 5】模型网络搭建与双轨损失训练循环 (5 个 Epoch)")
+    print("【步骤 5】双体系模型训练循环 (5 个 Epoch)")
+    print("   - 体系 A【当前主方案】：L2 超球面归一化 + InfoNCE 损失 (cos 相似度空间)")
+    print("   - 体系 B【传统对照组】：自由欧氏空间 + 经典欧氏 Hinge 损失")
     print("-" * 40)
 
     num_features = full_data.shape[1]
     device = torch.device('cpu')
-    model = NewBinModel(num_features=num_features, embed_dim=100).to(device)
 
-    # 双轨联合损失函数: L_total = L_main + 0.1 * L_co
-    criterion = MetagenomicPipelineLoss(main_loss_type="hinge", lambda_co=0.1, margin=1.0)
-    optimizer = torch.optim.AdamW(model.parameters(), lr=1e-3, weight_decay=1e-4)
+    # 体系 A: 超球面余弦体系
+    model_cosine = NewBinModel(num_features=num_features, embed_dim=100, l2_norm=True).to(device)
+    criterion_cosine = MetagenomicPipelineLoss(main_loss_type="infonce", lambda_co=0.1, temperature=0.1)
+    optimizer_cosine = torch.optim.AdamW(model_cosine.parameters(), lr=1e-3, weight_decay=1e-4)
 
-    print(f"[OK] 模型架构概要:")
-    print(f"   - 输入总维度: {num_features}")
-    print(f"   - k-mer 分支: Linear(136 -> 256) -> BN -> LeakyReLU -> Linear(256 -> 64)")
-    print(f"   - 长度门控:   log(1+L) -> Linear(1 -> 1) -> Sigmoid -> g(1)")
-    print(f"   - Coverage支路: Linear({2*M+1} -> 64) -> BN -> LeakyReLU -> Linear(64 -> 32)")
-    print(f"   - 融合网络:   Linear(64+32=96 -> 100 维)")
+    # 体系 B: 传统欧氏体系
+    model_euclidean = NewBinModel(num_features=num_features, embed_dim=100, l2_norm=False).to(device)
+    criterion_euclidean = MetagenomicPipelineLoss(main_loss_type="hinge", lambda_co=0.1, margin=1.0)
+    optimizer_euclidean = torch.optim.AdamW(model_euclidean.parameters(), lr=1e-3, weight_decay=1e-4)
 
-    model.train()
+    print(f"[OK] 模型初始化完成 (输入总维度={num_features}):")
+    print(f"   - 体系 A: l2_norm=True  (超球面投影, InfoNCE tau=0.1)")
+    print(f"   - 体系 B: l2_norm=False (自由欧氏空间, Hinge margin=1.0)")
+
+    # 训练体系 A (余弦 + InfoNCE)
+    print("\n>>> 开始训练【体系 A：超球面余弦 + InfoNCE】...")
+    model_cosine.train()
     for epoch in range(1, 6):
-        total_loss_accum = 0.0
-        main_loss_accum = 0.0
-        co_loss_accum = 0.0
-        batches = 0
-
+        tot_loss, m_loss, c_loss, nb = 0.0, 0.0, 0.0, 0
         for b_x1, b_x2, b_lbl in loader:
-            optimizer.zero_grad()
-
-            # 1. 切片提取原始 Shape 特征 d (M维)
+            optimizer_cosine.zero_grad()
             d_shape1 = extract_shape_features(b_x1)
             d_shape2 = extract_shape_features(b_x2)
-
-            # 2. 孪生前向传播，同时返回最终 z 与 Coverage z_c
-            (z1, z2), (zc1, zc2) = model(b_x1, b_x2, return_zc=True)
-
-            # 3. 计算双轨损失
-            loss_dict = criterion.forward_pairwise(
-                z1=z1, z2=z2,
-                zc1=zc1, zc2=zc2,
+            (z1, z2), (zc1, zc2) = model_cosine(b_x1, b_x2, return_zc=True)
+            loss_dict = criterion_cosine.forward_pairwise(
+                z1=z1, z2=z2, zc1=zc1, zc2=zc2,
                 d_shape1=d_shape1, d_shape2=d_shape2,
                 labels=b_lbl
             )
-
             loss = loss_dict["total_loss"]
             loss.backward()
-            optimizer.step()
+            optimizer_cosine.step()
+            tot_loss += loss.item()
+            m_loss += loss_dict["main_loss"].item()
+            c_loss += loss_dict["co_loss"].item()
+            nb += 1
+        print(f"   [Cosine] Epoch [{epoch}/5] - 总损失: {tot_loss/nb:.4f} | InfoNCE: {m_loss/nb:.4f} | L_co: {c_loss/nb:.4f}")
 
-            total_loss_accum += loss.item()
-            main_loss_accum += loss_dict["main_loss"].item()
-            co_loss_accum += loss_dict["co_loss"].item()
-            batches += 1
+    # 训练体系 B (欧氏 + Hinge)
+    print("\n>>> 开始训练【体系 B：自由欧氏 + Hinge Loss】...")
+    model_euclidean.train()
+    for epoch in range(1, 6):
+        tot_loss, m_loss, c_loss, nb = 0.0, 0.0, 0.0, 0
+        for b_x1, b_x2, b_lbl in loader:
+            optimizer_euclidean.zero_grad()
+            d_shape1 = extract_shape_features(b_x1)
+            d_shape2 = extract_shape_features(b_x2)
+            (z1, z2), (zc1, zc2) = model_euclidean(b_x1, b_x2, return_zc=True)
+            loss_dict = criterion_euclidean.forward_pairwise(
+                z1=z1, z2=z2, zc1=zc1, zc2=zc2,
+                d_shape1=d_shape1, d_shape2=d_shape2,
+                labels=b_lbl
+            )
+            loss = loss_dict["total_loss"]
+            loss.backward()
+            optimizer_euclidean.step()
+            tot_loss += loss.item()
+            m_loss += loss_dict["main_loss"].item()
+            c_loss += loss_dict["co_loss"].item()
+            nb += 1
+        print(f"   [Euclid] Epoch [{epoch}/5] - 总损失: {tot_loss/nb:.4f} | Hinge: {m_loss/nb:.4f} | L_co: {c_loss/nb:.4f}")
 
-        avg_total = total_loss_accum / max(1, batches)
-        avg_main = main_loss_accum / max(1, batches)
-        avg_co = co_loss_accum / max(1, batches)
-
-        print(f"   Epoch [{epoch}/5] - 总损失: {avg_total:.4f} | 主损失(Hinge): {avg_main:.4f} | 辅助共丰度损失(L_co): {avg_co:.4f}")
-
-    # 保存训练好的模型权重
-    model_save_path = os.path.join(output_dir, "model.pt")
-    model.save_with_params_to(model_save_path)
-    print(f"[OK] 训练完毕，模型权重已导出至: {model_save_path}")
+    # 导出权重
+    model_cos_path = os.path.join(output_dir, "model_cosine.pt")
+    model_euc_path = os.path.join(output_dir, "model_euclidean.pt")
+    model_cosine.save_with_params_to(model_cos_path)
+    model_cosine.save_with_params_to(os.path.join(output_dir, "model.pt"))
+    model_euclidean.save_with_params_to(model_euc_path)
+    print(f"[OK] 训练权重导出成功: {model_cos_path} 与 {model_euc_path}")
 
     # -------------------------------------------------------------------------
-    # 步骤 6: 全体 Contig 嵌入向量生成与 Leiden 聚类分箱
+    # 步骤 6: 全体 Contig 嵌入向量生成与双体系建图分箱
     # -------------------------------------------------------------------------
     print("\n" + "-" * 40)
-    print("【步骤 6】生成 100 维 Embedding 与双轨图 Leiden 聚类")
+    print("【步骤 6】双体系 Embedding 生成与双轨图 Leiden 聚类")
     print("-" * 40)
 
-    loaded_model = model_load(model_save_path, device=device)
-    loaded_model.eval()
+    model_cosine.eval()
+    model_euclidean.eval()
 
     with torch.no_grad():
         all_x = torch.from_numpy(features_arr).to(device)
-        embeddings = loaded_model.embedding(all_x).cpu().numpy()
+        emb_cosine = model_cosine.embedding(all_x).cpu().numpy()
+        emb_euclidean = model_euclidean.embedding(all_x).cpu().numpy()
 
-    print(f"[OK] 全体 Contig 嵌入特征矩阵形状: {embeddings.shape} (固定 100 维)")
-    emb_norms = np.linalg.norm(embeddings, axis=1)
-    print(f"[OK] 嵌入向量模长统计: 均值={emb_norms.mean():.4f}, 最小={emb_norms.min():.4f}, 最大={emb_norms.max():.4f}")
+    print(f"[OK] 嵌入特征维度透视:")
+    print(f"   - 体系 A (余弦超球面) 模长均值: {np.linalg.norm(emb_cosine, axis=1).mean():.4f} (严格超球面归一)")
+    print(f"   - 体系 B (自由欧氏空间) 模长均值: {np.linalg.norm(emb_euclidean, axis=1).mean():.4f} (自由欧氏向量)")
 
-    # 构建双轨增强图
-    g, weights = build_dual_track_graph(
-        embedding=embeddings,
+    cannot_pairs_formatted = [(full_data.index[p[0]], full_data.index[p[1]]) for p in cannot_pairs]
+
+    # 6.1 体系 A 建图 (余弦相似度)
+    g_cos, w_cos = build_dual_track_graph(
+        embedding=emb_cosine,
         contig_names=list(full_data.index),
         pe_links=pe_counts,
         k_neighbors=min(5, N - 1),
-        cannot_pairs=[(full_data.index[p[0]], full_data.index[p[1]]) for p in cannot_pairs]
+        graph_metric='cosine',
+        cannot_pairs=cannot_pairs_formatted
     )
-    print(f"[OK] 双轨增强图构建成功: 节点数={g.vcount()}, 边数={g.ecount()}")
+    labels_cos = run_leiden_clustering(g_cos, w_cos, resolution=1.0)
+    print(f"[OK] 体系 A【余弦超球面】Leiden 聚类: 边数={g_cos.ecount()}, 产生簇数={len(set(labels_cos))}")
 
-    # 运行 Leiden 社区聚类划分
-    cluster_labels = run_leiden_clustering(g, weights, resolution=1.0)
-    unique_bins = set(cluster_labels)
-    print(f"[OK] Leiden 聚类划分完成: 共划分出 {len(unique_bins)} 个 Bin 簇")
+    # 6.2 体系 B 建图 (截断欧氏距离 S_ij = max(0, 1 - d))
+    g_euc, w_euc = build_dual_track_graph(
+        embedding=emb_euclidean,
+        contig_names=list(full_data.index),
+        pe_links=pe_counts,
+        k_neighbors=min(5, N - 1),
+        graph_metric='euclidean',
+        cannot_pairs=cannot_pairs_formatted
+    )
+    labels_euc = run_leiden_clustering(g_euc, w_euc, resolution=1.0)
+    print(f"[OK] 体系 B【传统欧氏截断】Leiden 聚类: 边数={g_euc.ecount()}, 产生簇数={len(set(labels_euc))}")
 
-    # 统计各 Bin 分布
-    from collections import Counter
-    bin_counts = Counter(cluster_labels)
-    for b_id, cnt in sorted(bin_counts.items()):
-        print(f"   - Bin #{b_id:02d}: 包含 {cnt} 条 Contig")
-
-    # 导出 Leiden 结果为 CSV
-    res_df = pd.DataFrame({
-        'contig_name': full_data.index,
-        'bin_id': cluster_labels
-    })
-    res_csv = os.path.join(output_dir, "bin_clusters.csv")
-    res_leiden_csv = os.path.join(output_dir, "bin_clusters_leiden.csv")
-    res_df.to_csv(res_csv, index=False)
-    res_df.to_csv(res_leiden_csv, index=False)
-    print(f"[OK] Leiden 聚类结果已保存至: {res_leiden_csv}")
+    # 导出结果
+    res_cos_df = pd.DataFrame({'contig_name': full_data.index, 'bin_id': labels_cos})
+    res_euc_df = pd.DataFrame({'contig_name': full_data.index, 'bin_id': labels_euc})
+    res_cos_df.to_csv(os.path.join(output_dir, "bin_clusters_cosine.csv"), index=False)
+    res_cos_df.to_csv(os.path.join(output_dir, "bin_clusters.csv"), index=False)
+    res_euc_df.to_csv(os.path.join(output_dir, "bin_clusters_euclidean.csv"), index=False)
 
     # -------------------------------------------------------------------------
     # 步骤 7: 消融对照组 (HDBSCAN 空间几何密度聚类)
@@ -319,11 +338,8 @@ def main():
     print("【步骤 7】消融对照组：空间几何密度聚类 (HDBSCAN, euclidean)")
     print("-" * 40)
 
-    from sklearn.preprocessing import normalize
-    norm_embeddings = normalize(embeddings, norm='l2', axis=1)
-
     hdb_labels, n_hdb_clusters, n_hdb_noise = run_hdbscan_clustering(
-        embedding=norm_embeddings,
+        embedding=emb_cosine,
         contig_names=list(full_data.index),
         min_cluster_size=3,
         metric='euclidean'
@@ -336,67 +352,66 @@ def main():
         'contig_name': full_data.index,
         'bin_id': [f"hdb_{lbl}" if lbl != -1 else "Unbinned" for lbl in hdb_labels]
     })
-    res_hdb_csv = os.path.join(output_dir, "bin_clusters_hdbscan.csv")
-    hdb_df.to_csv(res_hdb_csv, index=False)
-    print(f"[OK] HDBSCAN 聚类结果已保存至: {res_hdb_csv}")
+    hdb_df.to_csv(os.path.join(output_dir, "bin_clusters_hdbscan.csv"), index=False)
 
     # -------------------------------------------------------------------------
-    # 步骤 8: 基准评测横向消融对比 (Benchmark Evaluation)
+    # 步骤 8: 核心体系级对决基准评测消融对比看板 (Ground Truth Benchmark)
     # -------------------------------------------------------------------------
     gt_path = os.path.join(test_data_dir, "ground_truth.csv")
     if os.path.exists(gt_path):
-        print("\n" + "=" * 80)
-        print("【步骤 8】分箱质量基准评测消融对比 (Ground Truth Benchmark)")
-        print("=" * 80)
+        print("\n" + "=" * 105)
+        print("【步骤 8】核心体系级对决基准评测消融对比看板 (Ablation Benchmark Dashboard)")
+        print("对比双方: 【超球面余弦体系 (cos + InfoNCE)】 vs 【传统欧氏体系 (欧氏距离 + Hinge)】 vs 【纯几何密度基线 (HDBSCAN)】")
+        print("=" * 105)
 
         c2g = load_ground_truth(gt_path)
-        c2b_leiden = dict(zip(res_df['contig_name'].astype(str), res_df['bin_id'].astype(str)))
+        c2b_cos = dict(zip(res_cos_df['contig_name'].astype(str), res_cos_df['bin_id'].astype(str)))
+        c2b_euc = dict(zip(res_euc_df['contig_name'].astype(str), res_euc_df['bin_id'].astype(str)))
         c2b_hdb = dict(zip(hdb_df['contig_name'].astype(str), hdb_df['bin_id'].astype(str)))
 
-        # 1. 评估 Leiden (双轨图 + 物理先验)
-        m_leiden = compute_benchmark_metrics(
-            contig2bin=c2b_leiden,
-            contig2genome=c2g,
-            contig_lens=contig_lens,
-            short_threshold=2000
-        )
+        # 1. 评估超球面余弦体系 (主方案)
+        m_cos = compute_benchmark_metrics(contig2bin=c2b_cos, contig2genome=c2g, contig_lens=contig_lens, short_threshold=2000)
+        # 2. 评估传统欧氏体系 (旧方案对照组)
+        m_euc = compute_benchmark_metrics(contig2bin=c2b_euc, contig2genome=c2g, contig_lens=contig_lens, short_threshold=2000)
+        # 3. 评估 HDBSCAN (纯空间几何密度对照组)
+        m_hdb = compute_benchmark_metrics(contig2bin=c2b_hdb, contig2genome=c2g, contig_lens=contig_lens, short_threshold=2000)
 
-        # 2. 评估 HDBSCAN (空间几何密度对照组)
-        m_hdb = compute_benchmark_metrics(
-            contig2bin=c2b_hdb,
-            contig2genome=c2g,
-            contig_lens=contig_lens,
-            short_threshold=2000
-        )
+        sc = m_cos['summary']
+        se = m_euc['summary']
+        sh = m_hdb['summary']
 
-        s_l = m_leiden['summary']
-        s_h = m_hdb['summary']
+        # 4. 打印三维横向对比看板
+        col_m = "消融评测核心指标 (Ablation Metric)"
+        col_c = "余弦+InfoNCE (主方案)"
+        col_e = "欧氏+Hinge (旧方案)"
+        col_h = "HDBSCAN (几何密度)"
+        print(f"\n{col_m:<38} | {col_c:<20} | {col_e:<20} | {col_h:<20}")
+        print("-" * 105)
+        print(f"{'高质量 MAGs (HQ MAGs: >90% comp, <5% contam)':<38} | {sc['High_Quality_MAGs (HQ)']:<20} | {se['High_Quality_MAGs (HQ)']:<20} | {sh['High_Quality_MAGs (HQ)']:<20}")
+        print(f"{'中等质量 MAGs (MQ MAGs)':<38} | {sc['Medium_Quality_MAGs (MQ)']:<20} | {se['Medium_Quality_MAGs (MQ)']:<20} | {sh['Medium_Quality_MAGs (MQ)']:<20}")
+        print(f"{'宏平均完整度 (Mean Completeness)':<38} | {sc['Mean_Completeness'] * 100:>18.2f}% | {se['Mean_Completeness'] * 100:>18.2f}% | {sh['Mean_Completeness'] * 100:>18.2f}%")
+        print(f"{'宏平均污染度 (Mean Contamination)':<38} | {sc['Mean_Contamination'] * 100:>18.2f}% | {se['Mean_Contamination'] * 100:>18.2f}% | {sh['Mean_Contamination'] * 100:>18.2f}%")
+        print(f"{'宏平均 F1-Score':<38} | {sc['Mean_F1_Score']:>19.4f} | {se['Mean_F1_Score']:>19.4f} | {sh['Mean_F1_Score']:>19.4f}")
+        print(f"{'调整兰德指数 (ARI)':<38} | {sc['ARI']:>19.4f} | {se['ARI']:>19.4f} | {sh['ARI']:>19.4f}")
+        print(f"{'标准化互信息 (NMI)':<38} | {sc['NMI']:>19.4f} | {se['NMI']:>19.4f} | {sh['NMI']:>19.4f}")
+        print(f"{'全基因组碱基分箱率 (Binned BP Rate)':<38} | {sc['Binned_BP_Rate'] * 100:>18.2f}% | {se['Binned_BP_Rate'] * 100:>18.2f}% | {sh['Binned_BP_Rate'] * 100:>18.2f}%")
 
-        # 3. 打印消融对比表格看板
-        print(f"\n{'消融评测核心指标 (Ablation Metric)':<38} | {'Leiden (双轨物理增强)':<22} | {'HDBSCAN (纯密度基线)':<22}")
-        print("-" * 88)
-        print(f"{'高质量 MAGs (HQ MAGs: >90% comp, <5% contam)':<38} | {s_l['High_Quality_MAGs (HQ)']:<22} | {s_h['High_Quality_MAGs (HQ)']:<22}")
-        print(f"{'中等质量 MAGs (MQ MAGs)':<38} | {s_l['Medium_Quality_MAGs (MQ)']:<22} | {s_h['Medium_Quality_MAGs (MQ)']:<22}")
-        print(f"{'宏平均完整度 (Mean Completeness)':<38} | {s_l['Mean_Completeness'] * 100:>20.2f}% | {s_h['Mean_Completeness'] * 100:>20.2f}%")
-        print(f"{'宏平均污染度 (Mean Contamination)':<38} | {s_l['Mean_Contamination'] * 100:>20.2f}% | {s_h['Mean_Contamination'] * 100:>20.2f}%")
-        print(f"{'宏平均 F1-Score':<38} | {s_l['Mean_F1_Score']:>21.4f} | {s_h['Mean_F1_Score']:>21.4f}")
-        print(f"{'调整兰德指数 (ARI)':<38} | {s_l['ARI']:>21.4f} | {s_h['ARI']:>21.4f}")
-        print(f"{'标准化互信息 (NMI)':<38} | {s_l['NMI']:>21.4f} | {s_h['NMI']:>21.4f}")
-        print(f"{'全基因组碱基分箱率 (Binned BP Rate)':<38} | {s_l['Binned_BP_Rate'] * 100:>20.2f}% | {s_h['Binned_BP_Rate'] * 100:>20.2f}%")
+        # 5. 短序列拯救能力对比 (< 2000 bp)
+        r_cnt_c = sc.get('Short_Rescue_Rate_Count', 0.0) * 100
+        r_cnt_e = se.get('Short_Rescue_Rate_Count', 0.0) * 100
+        r_cnt_h = sh.get('Short_Rescue_Rate_Count', 0.0) * 100
 
-        # 4. 短序列拯救能力对比 (< 2000 bp)
-        r_cnt_leiden = s_l.get('Short_Rescue_Rate_Count', 0.0) * 100
-        r_cnt_hdb = s_h.get('Short_Rescue_Rate_Count', 0.0) * 100
-        r_bp_leiden = s_l.get('Short_Rescue_Rate_BP', 0.0) * 100
-        r_bp_hdb = s_h.get('Short_Rescue_Rate_BP', 0.0) * 100
+        r_bp_c = sc.get('Short_Rescue_Rate_BP', 0.0) * 100
+        r_bp_e = se.get('Short_Rescue_Rate_BP', 0.0) * 100
+        r_bp_h = sh.get('Short_Rescue_Rate_BP', 0.0) * 100
 
-        print(f"{'短序列与质粒条数拯救率 (<2kb Count Rescue)':<38} | {r_cnt_leiden:>20.1f}% | {r_cnt_hdb:>20.1f}%")
-        print(f"{'短序列与质粒碱基拯救率 (<2kb BP Rescue)':<38} | {r_bp_leiden:>20.1f}% | {r_bp_hdb:>20.1f}%")
-        print("-" * 88)
+        print(f"{'短序列与质粒条数拯救率 (<2kb Count Rescue)':<38} | {r_cnt_c:>18.1f}% | {r_cnt_e:>18.1f}% | {r_cnt_h:>18.1f}%")
+        print(f"{'短序列与质粒碱基拯救率 (<2kb BP Rescue)':<38} | {r_bp_c:>18.1f}% | {r_bp_e:>18.1f}% | {r_bp_h:>18.1f}%")
+        print("-" * 105)
 
-    print("\n" + "=" * 80)
-    print("       >>> 全流程端到端调试完成！所有模块数据流转顺畅，验证通过！")
-    print("=" * 80)
+    print("\n" + "=" * 105)
+    print("       >>> 全流程端到端体系级消融对照调试完成！所有模块数据流转顺畅，验证通过！")
+    print("=" * 105)
 
 
 if __name__ == '__main__':

@@ -1,6 +1,7 @@
 import unittest
 import os
 import sys
+import logging
 import tempfile
 import numpy as np
 import pandas as pd
@@ -276,7 +277,65 @@ class TestDualTrackCluster(unittest.TestCase):
             self.assertIn('contig', df_bins.columns)
             self.assertIn('bin', df_bins.columns)
 
+    def test_build_dual_track_graph_truncated_euclidean(self):
+        """测试截断欧氏距离建图: S_ij = max(0, 1.0 - min(d, 1.0)) 对齐 Hinge Loss margin=1.0"""
+        contig_names = ['c0', 'c1', 'c2']
+        embedding = np.zeros((3, 10), dtype=np.float32)
+        # c0 at origin
+        # c1 at dist = 0.4 (< 1.0, margin 内)
+        embedding[1, 0] = 0.4
+        # c2 at dist = 1.5 (>= 1.0, 超出 margin)
+        embedding[2, 0] = 1.5
+
+        g, weights = build_dual_track_graph(
+            embedding=embedding,
+            contig_names=contig_names,
+            k_neighbors=2,
+            graph_metric='euclidean'
+        )
+
+        u0, u1, u2 = 0, 1, 2
+        eid_01 = g.get_eid(u0, u1, error=False)
+        self.assertNotEqual(eid_01, -1)
+        # S_01 应当精确为 1.0 - 0.4 = 0.6
+        np.testing.assert_allclose(weights[eid_01], 0.6, rtol=1e-4)
+
+        eid_02 = g.get_eid(u0, u2, error=False)
+        if eid_02 != -1:
+            # 若包含该边，权重必须截断为 0.0
+            np.testing.assert_allclose(weights[eid_02], 0.0, atol=1e-5)
+
+    def test_run_dual_track_leiden_with_euclidean_metric(self):
+        """测试端到端双轨 Leiden 聚类支持切换 euclidean 距离体系"""
+        logger = logging.getLogger('TestEuclideanLeiden')
+        num_contigs = 6
+        num_features = 137
+        contig_names = [f"seq_{i}" for i in range(num_contigs)]
+        data_arr = np.random.rand(num_contigs, num_features).astype(np.float32)
+        data_arr[:, -1] = 3000.0
+        df = pd.DataFrame(data_arr, index=contig_names)
+        contig_dict = {name: "ATCG" * 750 for name in contig_names}
+
+        # 自由欧氏模型: l2_norm=False
+        model = NewBinModel(num_features=num_features, l2_norm=False)
+        model.eval()
+
+        emb, labels = run_dual_track_leiden(
+            logger=logger,
+            model=model,
+            data=df,
+            device=torch.device('cpu'),
+            contig_dict=contig_dict,
+            k_neighbors=3,
+            graph_metric='euclidean'
+        )
+
+        self.assertEqual(emb.shape, (num_contigs, 100))
+        self.assertEqual(len(labels), num_contigs)
+        self.assertTrue(all(l >= 0 for l in labels))
+
 
 if __name__ == '__main__':
     unittest.main()
+
 

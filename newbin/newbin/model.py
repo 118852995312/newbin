@@ -35,6 +35,7 @@ import numpy as np
 import pandas as pd
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
 from torch.utils.data import Dataset, DataLoader
 
 from .loss import (
@@ -64,6 +65,7 @@ class NewBinModel(nn.Module):
        将 2M+1 维 Coverage 编码为 32 维向量 z_C。
     4. 融合网络：拼接门控 k-mer 嵌入 (64 维) 与 Coverage 嵌入 (32 维) 得到 96 维，
        通过单层 Linear 融合输出 100 维的最终嵌入向量。
+    5. 超球面归一化：支持可选的 L2 归一化开关（l2_norm=True，投影到单位超球面上）。
 
     Parameters
     ----------
@@ -75,14 +77,17 @@ class NewBinModel(nn.Module):
         Coverage MLP 隐层维度，默认为 64。
     embed_dim : int, optional
         最终输出嵌入向量维度，默认 100。
+    l2_norm : bool, optional
+        是否在融合输出端应用 L2 超球面归一化（默认 True，用于 cos/InfoNCE 体系；为 False 时用于欧氏 Hinge 体系）。
     """
 
-    def __init__(self, num_features: int, kmer_hidden_dim: int = 256, cov_hidden_dim: int = 64, embed_dim: int = 100):
+    def __init__(self, num_features: int, kmer_hidden_dim: int = 256, cov_hidden_dim: int = 64, embed_dim: int = 100, l2_norm: bool = True):
         super().__init__()
         self.num_features = num_features
         self.kmer_hidden_dim = kmer_hidden_dim
         self.cov_hidden_dim = cov_hidden_dim
         self.embed_dim = embed_dim
+        self.l2_norm = l2_norm
 
         # ---------------------------------------------------------------
         # 1. k-mer 编码器分支 (输入 136 维 -> 隐层 -> 64 维 z_embedding)
@@ -124,7 +129,7 @@ class NewBinModel(nn.Module):
             # 无 coverage 时，仅输入 64 维 k-mer -> Linear(64 -> 100)
             self.fusion = nn.Linear(64, embed_dim)
 
-    def embedding(self, x: torch.Tensor, length: torch.Tensor = None, return_zc: bool = False):
+    def embedding(self, x: torch.Tensor, length: torch.Tensor = None, return_zc: bool = False, l2_norm: bool = None):
         """
         生成嵌入向量（cluster.py / 推理使用，或训练时同时提取 Coverage 嵌入）。
 
@@ -136,6 +141,8 @@ class NewBinModel(nn.Module):
             若单独传入长度张量，则优先使用该参数。
         return_zc : bool, optional
             是否同时返回 Coverage 分支输出 z_c (32 维)。默认为 False。
+        l2_norm : bool, optional
+            是否在最终输出端应用 L2 超球面归一化。若为 None 则使用实例属性 self.l2_norm。
 
         Returns
         -------
@@ -175,6 +182,11 @@ class NewBinModel(nn.Module):
         else:
             out = self.fusion(z_kmer_gated)                    # 64 -> 100 维
 
+        # 6. 超球面投影 (L2 归一化)
+        apply_norm = self.l2_norm if l2_norm is None else l2_norm
+        if apply_norm:
+            out = F.normalize(out, p=2, dim=-1)
+
         if return_zc:
             return out, z_c
         return out
@@ -208,7 +220,7 @@ class NewBinModel(nn.Module):
         torch.save({
             'model_name': self.__class__.__name__,
             'model_state_dict': self.state_dict(),
-            'params': (self.num_features, self.kmer_hidden_dim, self.cov_hidden_dim, self.embed_dim),
+            'params': (self.num_features, self.kmer_hidden_dim, self.cov_hidden_dim, self.embed_dim, self.l2_norm),
         }, path)
         logger.info(f'Model saved to {path}')
 
@@ -235,9 +247,12 @@ def model_load(path: str, device: torch.device) -> NewBinModel:
     elif len(params) == 3:
         num_features, kmer_hidden_dim, embed_dim = params
         model = NewBinModel(num_features=num_features, kmer_hidden_dim=kmer_hidden_dim, embed_dim=embed_dim)
-    else:
+    elif len(params) == 4:
         num_features, kmer_hidden_dim, cov_hidden_dim, embed_dim = params
         model = NewBinModel(num_features=num_features, kmer_hidden_dim=kmer_hidden_dim, cov_hidden_dim=cov_hidden_dim, embed_dim=embed_dim)
+    else:
+        num_features, kmer_hidden_dim, cov_hidden_dim, embed_dim, l2_norm = params
+        model = NewBinModel(num_features=num_features, kmer_hidden_dim=kmer_hidden_dim, cov_hidden_dim=cov_hidden_dim, embed_dim=embed_dim, l2_norm=l2_norm)
 
     model.load_state_dict(data['model_state_dict'])
     model.to(device)
@@ -502,7 +517,8 @@ def train_model(
     # 2. 初始化网络、联合损失与优化器
     # ---------------------------------------------------------------
     torch.set_num_threads(max(1, num_process))
-    model = NewBinModel(num_features=num_features).to(device)
+    l2_norm = kwargs.get('l2_norm', main_loss_type.lower() in ['infonce', 'supcon'])
+    model = NewBinModel(num_features=num_features, l2_norm=l2_norm).to(device)
 
     criterion = MetagenomicPipelineLoss(
         main_loss_type=main_loss_type,

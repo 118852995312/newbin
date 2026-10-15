@@ -229,6 +229,64 @@ class SupConLoss(nn.Module):
         return loss
 
 
+class PairwiseInfoNCELoss(nn.Module):
+    """
+    成对批次 InfoNCE 对比损失 (工作于超球面空间):
+    基于余弦相似度矩阵与温度系数 tau 构建 Softmax 全局负样本排斥场。
+
+    数学公式:
+        S_ij = (z1_i · z2_j) / tau
+        L_12 = - (1 / |Pos|) * sum_{i in Pos} log( exp(S_ii) / sum_j exp(S_ij) )
+    支持双向对称对比（Bidirectional Contrastive）。
+    """
+
+    def __init__(self, temperature: float = 0.1, bidirectional: bool = True):
+        super().__init__()
+        self.temperature = temperature
+        self.bidirectional = bidirectional
+
+    def forward(self, z1: torch.Tensor, z2: torch.Tensor, labels: torch.Tensor = None) -> torch.Tensor:
+        """
+        Parameters
+        ----------
+        z1, z2 : torch.Tensor, shape (B, D)
+            两组样本嵌入特征向量 (若未预先归一化，内部做 L2-Norm)
+        labels : torch.Tensor, optional, shape (B,)
+            1.0 为 must-link 正对，0.0 为 cannot-link 负对
+        """
+        batch_size = z1.size(0)
+        if batch_size <= 1:
+            return torch.tensor(0.0, device=z1.device, requires_grad=True)
+
+        # 保证在单位超球面上
+        z1_norm = F.normalize(z1, p=2, dim=-1)
+        z2_norm = F.normalize(z2, p=2, dim=-1)
+
+        # 计算全批次余弦相似度除以温度 tau: shape (B, B)
+        sim_matrix = torch.matmul(z1_norm, z2_norm.T) / self.temperature
+
+        targets = torch.arange(batch_size, device=z1.device)
+
+        if labels is not None:
+            # 筛选真实正样本项 (labels == 1)
+            pos_mask = (labels > 0.5)
+            if not pos_mask.any():
+                # 若批次内全是负对，惩罚其对角相似度以推远
+                return F.relu(torch.diagonal(sim_matrix)).mean()
+
+            loss_12 = F.cross_entropy(sim_matrix[pos_mask], targets[pos_mask])
+            if self.bidirectional:
+                loss_21 = F.cross_entropy(sim_matrix.T[pos_mask], targets[pos_mask])
+                return 0.5 * (loss_12 + loss_21)
+            return loss_12
+        else:
+            loss_12 = F.cross_entropy(sim_matrix, targets)
+            if self.bidirectional:
+                loss_21 = F.cross_entropy(sim_matrix.T, targets)
+                return 0.5 * (loss_12 + loss_21)
+            return loss_12
+
+
 class MetagenomicPipelineLoss(nn.Module):
     """
     模型整体联合损失包装器:
@@ -237,7 +295,7 @@ class MetagenomicPipelineLoss(nn.Module):
 
     def __init__(
         self,
-        main_loss_type: str = "supcon",
+        main_loss_type: str = "infonce",
         lambda_co: float = 0.1,
         temperature: float = 0.1,
         margin: float = 1.0,
@@ -249,10 +307,12 @@ class MetagenomicPipelineLoss(nn.Module):
 
         if self.main_loss_type in ["supcon", "infonce"]:
             self.main_loss_fn = SupConLoss(temperature=temperature)
+            self.pairwise_main_loss_fn = PairwiseInfoNCELoss(temperature=temperature)
         elif self.main_loss_type in ["hinge", "contrastive"]:
             self.main_loss_fn = ContrastiveHingeLoss(margin=margin)
+            self.pairwise_main_loss_fn = ContrastiveHingeLoss(margin=margin)
         else:
-            raise ValueError(f"未知的损失函数类型: {main_loss_type} (仅支持 'supcon' 或 'hinge')")
+            raise ValueError(f"未知的损失函数类型: {main_loss_type} (仅支持 'infonce' 或 'hinge')")
 
         self.co_loss_fn = CoAbundanceAuxiliaryLoss(min_samples_threshold=min_samples_threshold)
 
@@ -265,22 +325,6 @@ class MetagenomicPipelineLoss(nn.Module):
     ) -> dict:
         """
         Batch 模式联合损失计算 (主要用于 SupCon 模式)。
-
-        Parameters
-        ----------
-        z : torch.Tensor, shape (B, D)
-            模型最终输出的 100 维 embedding
-        z_c : torch.Tensor, shape (B, 32)
-            Coverage 小网络输出特征
-        d_shape : torch.Tensor, shape (B, M)
-            输入中对应的原始 Shape 剖面
-        labels : torch.Tensor, shape (B,)
-            物种类别标签
-
-        Returns
-        -------
-        dict
-            {"total_loss": ..., "main_loss": ..., "co_loss": ...}
         """
         l_main = self.main_loss_fn(z, labels)
         l_co = self.co_loss_fn(z_c, d_shape)
@@ -296,37 +340,22 @@ class MetagenomicPipelineLoss(nn.Module):
         self,
         z1: torch.Tensor,
         z2: torch.Tensor,
-        zc1: torch.Tensor,
-        zc2: torch.Tensor,
-        d_shape1: torch.Tensor,
-        d_shape2: torch.Tensor,
-        labels: torch.Tensor
+        zc1: torch.Tensor = None,
+        zc2: torch.Tensor = None,
+        d_shape1: torch.Tensor = None,
+        d_shape2: torch.Tensor = None,
+        labels: torch.Tensor = None
     ) -> dict:
         """
-        孪生成对模式联合损失计算 (用于 Hinge 对比学习)。
-
-        Parameters
-        ----------
-        z1, z2 : torch.Tensor, shape (B, D)
-        zc1, zc2 : torch.Tensor, shape (B, 32)
-        d_shape1, d_shape2 : torch.Tensor, shape (B, M)
-        labels : torch.Tensor, shape (B,), 1 为 must-link, 0 为 cannot-link
+        孪生成对模式联合损失计算:
+          - infonce / supcon: 调用 PairwiseInfoNCELoss (超球面 Softmax 竞争场)
+          - hinge / contrastive: 调用 ContrastiveHingeLoss (欧氏边距平方损失)
         """
-        if self.main_loss_type in ["hinge", "contrastive"]:
-            l_main = self.main_loss_fn(z1, z2, labels)
+        l_main = self.pairwise_main_loss_fn(z1, z2, labels)
+        if zc1 is not None and zc2 is not None and d_shape1 is not None and d_shape2 is not None:
+            l_co = self.co_loss_fn.forward_pairwise(zc1, zc2, d_shape1, d_shape2)
         else:
-            # 若成对模式下使用 SupCon，将两组特征与伪标签拼入单一 Batch
-            z_all = torch.cat([z1, z2], dim=0)
-            # 生成伪分组标签: 同一索引配对标签相同
-            b = z1.size(0)
-            pair_ids = torch.arange(b, device=z1.device)
-            # 对于正对 (labels==1)，共享相同的类别 ID；对于负对，分配不同的类别 ID
-            id1 = pair_ids
-            id2 = torch.where(labels.long() == 1, pair_ids, pair_ids + b)
-            labels_all = torch.cat([id1, id2], dim=0)
-            l_main = self.main_loss_fn(z_all, labels_all)
-
-        l_co = self.co_loss_fn.forward_pairwise(zc1, zc2, d_shape1, d_shape2)
+            l_co = torch.tensor(0.0, device=z1.device, dtype=z1.dtype)
         total_loss = l_main + self.lambda_co * l_co
 
         return {

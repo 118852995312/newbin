@@ -233,6 +233,13 @@ def _add_binning_args(p):
                   help='Path to a trained model (.pt) file.',
                   dest='model_path',
                   default=None)
+    _safe_add_arg(p, '--metric-system',
+                  required=False,
+                  choices=['cosine', 'euclidean'],
+                  help='Metric system for graph construction: "cosine" (hyperspherical cosine similarity) '
+                       'or "euclidean" (truncated Euclidean similarity S_ij = max(0, 1 - d)). Default: auto-detect from model or cosine.',
+                  dest='metric_system',
+                  default=None)
     p.add_argument('--clustering-algorithm',
                    required=False,
                    choices=['leiden', 'hdbscan'],
@@ -397,12 +404,19 @@ def _add_training_args(p):
                    help='Path(s) to cannot_link.csv constraint file(s).',
                    dest='cannot_link',
                    default=None)
+    _safe_add_arg(p, '--metric-system',
+                  required=False,
+                  choices=['cosine', 'euclidean'],
+                  help='Metric & loss architecture system: "cosine" (L2 normalization + InfoNCE loss) '
+                       'or "euclidean" (free Euclidean space + Hinge loss).',
+                  dest='metric_system',
+                  default='cosine')
     p.add_argument('--loss-type',
                    required=False,
-                   choices=['hinge', 'supcon'],
-                   help='Main loss function type (hinge or supcon).',
+                   choices=['infonce', 'supcon', 'hinge', 'contrastive'],
+                   help='Main loss function type (infonce/supcon or hinge/contrastive). If omitted, inferred from --metric-system.',
                    dest='loss_type',
-                   default='hinge')
+                   default=None)
 
 
 def _add_feature_args(p):
@@ -711,13 +725,21 @@ def training(logger, data, data_split, *, output, device, mode, args):
 
     must_link = getattr(args, 'must_link', None) or data_split
     cannot_link = getattr(args, 'cannot_link', None)
-    loss_type = getattr(args, 'loss_type', 'hinge')
+    metric_system = getattr(args, 'metric_system', 'cosine') or 'cosine'
+    metric_system = str(metric_system).lower()
+
+    loss_type = getattr(args, 'loss_type', None)
+    if not loss_type:
+        loss_type = 'infonce' if metric_system == 'cosine' else 'hinge'
+    loss_type = str(loss_type).lower()
+
+    l2_norm = (metric_system == 'cosine')
     model_path = os.path.join(output, 'model.pt')
 
     if mode == 'single':
-        logger.info('Start training from a single sample.')
+        logger.info(f'Start training from a single sample (metric_system={metric_system}, loss={loss_type}, l2_norm={l2_norm}).')
     else:
-        logger.info('Start training from multiple samples.')
+        logger.info(f'Start training from multiple samples (metric_system={metric_system}, loss={loss_type}, l2_norm={l2_norm}).')
 
     model = train_model(logger=logger,
                         data=data,
@@ -729,6 +751,7 @@ def training(logger, data, data_split, *, output, device, mode, args):
                         num_process=args.num_process,
                         mode=mode,
                         main_loss_type=loss_type,
+                        l2_norm=l2_norm,
                         save_path=model_path)
     return model
 

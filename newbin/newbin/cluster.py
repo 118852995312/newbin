@@ -282,10 +282,32 @@ def build_dual_track_graph(
     pe_alpha: float = 0.9,
     pe_theta: float = 3.0,
     cannot_pairs=None,
+    graph_metric: str = 'cosine',
     logger=None
 ):
     """
     构建双轨增强图 (k-NN 全局语义骨架 + 成对 Reads 局部物理连通补强)。
+
+    参数:
+    ----------
+    embedding : np.ndarray
+        形状为 (N, D) 的特征嵌入矩阵。
+    contig_names : list
+        contig 序列名称列表。
+    pe_links : dict, optional
+        成对 Reads 物理连通对及计数 {(c1, c2): count}。
+    k_neighbors : int
+        k-NN 骨架图近邻数 (默认 15)。
+    pe_alpha : float
+        PE 物理直连最高边权 (默认 0.9)。
+    pe_theta : float
+        PE 饱和响应尺度 (默认 3.0)。
+    cannot_pairs : list, optional
+        先验互斥对 [(c1, c2), ...]。
+    graph_metric : str
+        距离度量体系: 'cosine' (默认, 余弦相似度) 或 'euclidean' (截断欧氏距离 S_ij = max(0, 1 - d))。
+    logger : Logger, optional
+        日志记录器。
     """
     from sklearn.neighbors import NearestNeighbors
     from igraph import Graph
@@ -299,25 +321,44 @@ def build_dual_track_graph(
         return g, np.array([], dtype=np.float32)
 
     # 1. 全局语义骨架 (k-NN 图)
-    norms = np.linalg.norm(embedding, axis=1, keepdims=True)
-    norms[norms == 0] = 1.0
-    norm_emb = embedding / norms
-
     actual_k = min(k_neighbors + 1, num_contigs)
-    nn = NearestNeighbors(n_neighbors=actual_k, metric='cosine')
-    nn.fit(norm_emb)
-    distances, indices = nn.kneighbors(norm_emb)
+    metric_lower = str(graph_metric).lower()
 
     edge_dict = {}
 
-    for i in range(num_contigs):
-        for dist, j in zip(distances[i], indices[i]):
-            if i == j:
-                continue
-            cos_sim = max(0.0, float(1.0 - dist))
-            pair = tuple(sorted([i, j]))
-            if pair not in edge_dict or cos_sim > edge_dict[pair]:
-                edge_dict[pair] = cos_sim
+    if metric_lower == 'euclidean':
+        # 传统欧氏体系：使用自由欧氏空间距离并按 margin=1.0 截断
+        nn = NearestNeighbors(n_neighbors=actual_k, metric='euclidean')
+        nn.fit(embedding)
+        distances, indices = nn.kneighbors(embedding)
+
+        for i in range(num_contigs):
+            for dist, j in zip(distances[i], indices[i]):
+                if i == j:
+                    continue
+                # 截断欧氏相似度: S_ij = max(0.0, 1.0 - min(d, 1.0))，与 Hinge Loss margin=1.0 判定边界严丝合缝
+                euc_sim = max(0.0, float(1.0 - min(dist, 1.0)))
+                pair = tuple(sorted([i, j]))
+                if pair not in edge_dict or euc_sim > edge_dict[pair]:
+                    edge_dict[pair] = euc_sim
+    else:
+        # 当前主方案：余弦超球面相似度
+        norms = np.linalg.norm(embedding, axis=1, keepdims=True)
+        norms[norms == 0] = 1.0
+        norm_emb = embedding / norms
+
+        nn = NearestNeighbors(n_neighbors=actual_k, metric='cosine')
+        nn.fit(norm_emb)
+        distances, indices = nn.kneighbors(norm_emb)
+
+        for i in range(num_contigs):
+            for dist, j in zip(distances[i], indices[i]):
+                if i == j:
+                    continue
+                cos_sim = max(0.0, float(1.0 - dist))
+                pair = tuple(sorted([i, j]))
+                if pair not in edge_dict or cos_sim > edge_dict[pair]:
+                    edge_dict[pair] = cos_sim
 
     num_knn_edges = len(edge_dict)
 
@@ -419,6 +460,7 @@ def run_dual_track_leiden(
     pe_must_link_file=None,
     cannot_link=None,
     resolution: float = 1.0,
+    graph_metric: str = 'cosine',
     num_process: int = 1,
     **kwargs
 ):
@@ -482,6 +524,7 @@ def run_dual_track_leiden(
         pe_alpha=pe_alpha,
         pe_theta=pe_theta,
         cannot_pairs=cannot_pairs,
+        graph_metric=graph_metric,
         logger=logger
     )
 
@@ -684,6 +727,10 @@ def cluster(logger, model, data, device, is_combined,
                     f'({100.0 * n_noise / len(contig_labels):.1f}% noise rate)')
     else:
         k_neighbors = getattr(args, 'k_neighbors', 15)
+        metric_system = getattr(args, 'metric_system', getattr(args, 'graph_metric', None))
+        if not metric_system:
+            metric_system = 'cosine' if getattr(model, 'l2_norm', True) else 'euclidean'
+        metric_system = str(metric_system).lower()
         pe_min_count = getattr(args, 'pe_min_count', 3)
         pe_alpha = getattr(args, 'pe_alpha', 0.9)
         pe_theta = getattr(args, 'pe_theta', 3.0)
@@ -710,6 +757,7 @@ def cluster(logger, model, data, device, is_combined,
             pe_must_link_file=pe_must_link,
             cannot_link=cannot_link,
             resolution=resolution,
+            graph_metric=metric_system,
             num_process=args.num_process
         )
 

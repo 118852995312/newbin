@@ -16,6 +16,7 @@ try:
         CoAbundanceAuxiliaryLoss,
         ContrastiveHingeLoss,
         SupConLoss,
+        PairwiseInfoNCELoss,
         MetagenomicPipelineLoss,
     )
 except (ImportError, ModuleNotFoundError):
@@ -28,6 +29,7 @@ except (ImportError, ModuleNotFoundError):
         CoAbundanceAuxiliaryLoss,
         ContrastiveHingeLoss,
         SupConLoss,
+        PairwiseInfoNCELoss,
         MetagenomicPipelineLoss,
     )
 
@@ -199,7 +201,71 @@ class TestLossModule(unittest.TestCase):
         expected_total = loss_dict["main_loss"] + 0.1 * loss_dict["co_loss"]
         self.assertTrue(torch.allclose(loss_dict["total_loss"], expected_total))
 
+    def test_pairwise_infonce_loss_basic_and_backprop(self):
+        """测试成对 InfoNCE 对比损失与全局负样本 Softmax 竞争场"""
+        loss_fn = PairwiseInfoNCELoss(temperature=0.1, bidirectional=True)
+
+        B = 4
+        D = 16
+        # 构造可导特征张量
+        z1 = torch.randn(B, D, requires_grad=True)
+        # 让 z2 与 z1 大致相似
+        z2 = (z1 + 0.1 * torch.randn(B, D)).detach().clone().requires_grad_(True)
+        # 全部为正对 (label=1)
+        labels = torch.ones(B)
+
+        loss = loss_fn(z1, z2, labels)
+        self.assertGreater(loss.item(), 0.0)
+        self.assertFalse(torch.isnan(loss))
+
+        # 验证梯度回传到两端分支
+        loss.backward()
+        self.assertIsNotNone(z1.grad)
+        self.assertIsNotNone(z2.grad)
+        self.assertTrue((z1.grad.abs().sum() > 0).item())
+        self.assertTrue((z2.grad.abs().sum() > 0).item())
+
+    def test_pairwise_infonce_loss_similarity_monotonicity(self):
+        """测试 InfoNCE 的单调性：正样本对越接近，损失越小；夹角越大，损失越大"""
+        loss_fn = PairwiseInfoNCELoss(temperature=0.1)
+
+        # 构造基准正样本对
+        z1 = torch.tensor([[1.0, 0.0], [0.0, 1.0]], dtype=torch.float32)
+        # 极高相似度正样本 (完全一致)
+        z2_identical = torch.tensor([[1.0, 0.0], [0.0, 1.0]], dtype=torch.float32)
+        # 较低相似度正样本 (夹角 45 度)
+        z2_deviated = torch.tensor([[1.0, 1.0], [-1.0, 1.0]], dtype=torch.float32)
+
+        labels = torch.tensor([1.0, 1.0])
+
+        loss_identical = loss_fn(z1, z2_identical, labels)
+        loss_deviated = loss_fn(z1, z2_deviated, labels)
+
+        self.assertLess(loss_identical.item(), loss_deviated.item(),
+                        "正样本对向量方向越一致，InfoNCE 损失应当越小")
+
+    def test_joint_pipeline_pairwise_infonce_and_hinge(self):
+        """测试 MetagenomicPipelineLoss 在成对训练模式下调度 infonce 与 hinge"""
+        joint_infonce = MetagenomicPipelineLoss(main_loss_type='infonce', lambda_co=0.1)
+        joint_hinge = MetagenomicPipelineLoss(main_loss_type='hinge', lambda_co=0.1)
+
+        B = 4
+        z1 = torch.randn(B, 100)
+        z2 = torch.randn(B, 100)
+        labels = torch.tensor([1.0, 0.0, 1.0, 0.0])
+
+        res_infonce = joint_infonce.forward_pairwise(z1, z2, labels=labels)
+        self.assertIn('total_loss', res_infonce)
+        self.assertIn('main_loss', res_infonce)
+        self.assertFalse(torch.isnan(res_infonce['total_loss']))
+
+        res_hinge = joint_hinge.forward_pairwise(z1, z2, labels=labels)
+        self.assertIn('total_loss', res_hinge)
+        self.assertIn('main_loss', res_hinge)
+        self.assertFalse(torch.isnan(res_hinge['total_loss']))
+
 
 if __name__ == '__main__':
     unittest.main()
+
 
