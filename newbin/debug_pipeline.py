@@ -30,8 +30,10 @@ from newbin.cluster import (
     parse_bam_pe_reads_stream,
     extract_pe_bridging_links,
     build_dual_track_graph,
-    run_leiden_clustering
+    run_leiden_clustering,
+    run_hdbscan_clustering
 )
+from newbin.evaluate import compute_benchmark_metrics, load_ground_truth
 from newbin.model import (
     NewBinModel,
     PairwiseContigDataset,
@@ -299,14 +301,98 @@ def main():
     for b_id, cnt in sorted(bin_counts.items()):
         print(f"   - Bin #{b_id:02d}: 包含 {cnt} 条 Contig")
 
-    # 结果导出为 CSV
+    # 导出 Leiden 结果为 CSV
     res_df = pd.DataFrame({
         'contig_name': full_data.index,
         'bin_id': cluster_labels
     })
     res_csv = os.path.join(output_dir, "bin_clusters.csv")
+    res_leiden_csv = os.path.join(output_dir, "bin_clusters_leiden.csv")
     res_df.to_csv(res_csv, index=False)
-    print(f"[OK] 聚类结果已保存至: {res_csv}")
+    res_df.to_csv(res_leiden_csv, index=False)
+    print(f"[OK] Leiden 聚类结果已保存至: {res_leiden_csv}")
+
+    # -------------------------------------------------------------------------
+    # 步骤 7: 消融对照组 (HDBSCAN 空间几何密度聚类)
+    # -------------------------------------------------------------------------
+    print("\n" + "-" * 40)
+    print("【步骤 7】消融对照组：空间几何密度聚类 (HDBSCAN, euclidean)")
+    print("-" * 40)
+
+    from sklearn.preprocessing import normalize
+    norm_embeddings = normalize(embeddings, norm='l2', axis=1)
+
+    hdb_labels, n_hdb_clusters, n_hdb_noise = run_hdbscan_clustering(
+        embedding=norm_embeddings,
+        contig_names=list(full_data.index),
+        min_cluster_size=3,
+        metric='euclidean'
+    )
+    print(f"[OK] HDBSCAN 对照组聚类完成:")
+    print(f"   - 识别有效簇数量: {n_hdb_clusters}")
+    print(f"   - 判定为噪声/未分箱数量: {n_hdb_noise} ({100.0 * n_hdb_noise / len(full_data):.1f}%)")
+
+    hdb_df = pd.DataFrame({
+        'contig_name': full_data.index,
+        'bin_id': [f"hdb_{lbl}" if lbl != -1 else "Unbinned" for lbl in hdb_labels]
+    })
+    res_hdb_csv = os.path.join(output_dir, "bin_clusters_hdbscan.csv")
+    hdb_df.to_csv(res_hdb_csv, index=False)
+    print(f"[OK] HDBSCAN 聚类结果已保存至: {res_hdb_csv}")
+
+    # -------------------------------------------------------------------------
+    # 步骤 8: 基准评测横向消融对比 (Benchmark Evaluation)
+    # -------------------------------------------------------------------------
+    gt_path = os.path.join(test_data_dir, "ground_truth.csv")
+    if os.path.exists(gt_path):
+        print("\n" + "=" * 80)
+        print("【步骤 8】分箱质量基准评测消融对比 (Ground Truth Benchmark)")
+        print("=" * 80)
+
+        c2g = load_ground_truth(gt_path)
+        c2b_leiden = dict(zip(res_df['contig_name'].astype(str), res_df['bin_id'].astype(str)))
+        c2b_hdb = dict(zip(hdb_df['contig_name'].astype(str), hdb_df['bin_id'].astype(str)))
+
+        # 1. 评估 Leiden (双轨图 + 物理先验)
+        m_leiden = compute_benchmark_metrics(
+            contig2bin=c2b_leiden,
+            contig2genome=c2g,
+            contig_lens=contig_lens,
+            short_threshold=2000
+        )
+
+        # 2. 评估 HDBSCAN (空间几何密度对照组)
+        m_hdb = compute_benchmark_metrics(
+            contig2bin=c2b_hdb,
+            contig2genome=c2g,
+            contig_lens=contig_lens,
+            short_threshold=2000
+        )
+
+        s_l = m_leiden['summary']
+        s_h = m_hdb['summary']
+
+        # 3. 打印消融对比表格看板
+        print(f"\n{'消融评测核心指标 (Ablation Metric)':<38} | {'Leiden (双轨物理增强)':<22} | {'HDBSCAN (纯密度基线)':<22}")
+        print("-" * 88)
+        print(f"{'高质量 MAGs (HQ MAGs: >90% comp, <5% contam)':<38} | {s_l['High_Quality_MAGs (HQ)']:<22} | {s_h['High_Quality_MAGs (HQ)']:<22}")
+        print(f"{'中等质量 MAGs (MQ MAGs)':<38} | {s_l['Medium_Quality_MAGs (MQ)']:<22} | {s_h['Medium_Quality_MAGs (MQ)']:<22}")
+        print(f"{'宏平均完整度 (Mean Completeness)':<38} | {s_l['Mean_Completeness'] * 100:>20.2f}% | {s_h['Mean_Completeness'] * 100:>20.2f}%")
+        print(f"{'宏平均污染度 (Mean Contamination)':<38} | {s_l['Mean_Contamination'] * 100:>20.2f}% | {s_h['Mean_Contamination'] * 100:>20.2f}%")
+        print(f"{'宏平均 F1-Score':<38} | {s_l['Mean_F1_Score']:>21.4f} | {s_h['Mean_F1_Score']:>21.4f}")
+        print(f"{'调整兰德指数 (ARI)':<38} | {s_l['ARI']:>21.4f} | {s_h['ARI']:>21.4f}")
+        print(f"{'标准化互信息 (NMI)':<38} | {s_l['NMI']:>21.4f} | {s_h['NMI']:>21.4f}")
+        print(f"{'全基因组碱基分箱率 (Binned BP Rate)':<38} | {s_l['Binned_BP_Rate'] * 100:>20.2f}% | {s_h['Binned_BP_Rate'] * 100:>20.2f}%")
+
+        # 4. 短序列拯救能力对比 (< 2000 bp)
+        r_cnt_leiden = s_l.get('Short_Rescue_Rate_Count', 0.0) * 100
+        r_cnt_hdb = s_h.get('Short_Rescue_Rate_Count', 0.0) * 100
+        r_bp_leiden = s_l.get('Short_Rescue_Rate_BP', 0.0) * 100
+        r_bp_hdb = s_h.get('Short_Rescue_Rate_BP', 0.0) * 100
+
+        print(f"{'短序列与质粒条数拯救率 (<2kb Count Rescue)':<38} | {r_cnt_leiden:>20.1f}% | {r_cnt_hdb:>20.1f}%")
+        print(f"{'短序列与质粒碱基拯救率 (<2kb BP Rescue)':<38} | {r_bp_leiden:>20.1f}% | {r_bp_hdb:>20.1f}%")
+        print("-" * 88)
 
     print("\n" + "=" * 80)
     print("       >>> 全流程端到端调试完成！所有模块数据流转顺畅，验证通过！")

@@ -16,7 +16,9 @@ from newbin.cluster import (
     extract_pe_bridging_links,
     build_dual_track_graph,
     run_leiden_clustering,
-    run_dual_track_leiden
+    run_dual_track_leiden,
+    run_hdbscan_clustering,
+    cluster
 )
 from newbin.model import NewBinModel
 
@@ -178,6 +180,101 @@ class TestDualTrackCluster(unittest.TestCase):
             self.assertEqual(emb.shape, (num_contigs, 100))
             self.assertEqual(len(labels), num_contigs)
             self.assertTrue(np.all(labels >= 0))
+
+    def test_run_hdbscan_clustering_synthetic(self):
+        """测试 HDBSCAN 对照组聚类在模拟高维空间中的有效聚类识别与噪声剔除"""
+        # 构造两组明显聚拢的点群与若干孤立噪声点
+        np.random.seed(42)
+        cluster1 = np.random.normal(loc=2.0, scale=0.1, size=(8, 100))
+        cluster2 = np.random.normal(loc=-2.0, scale=0.1, size=(8, 100))
+        outliers = np.array([
+            [10.0] * 100,
+            [-10.0] * 100
+        ])
+        embedding = np.vstack([cluster1, cluster2, outliers])
+        contig_names = [f"ctg_{i}" for i in range(len(embedding))]
+
+        labels, n_clusters, n_noise = run_hdbscan_clustering(
+            embedding=embedding,
+            contig_names=contig_names,
+            min_cluster_size=5,
+            metric='euclidean'
+        )
+
+        self.assertEqual(len(labels), len(embedding))
+        self.assertGreaterEqual(n_clusters, 2)
+        self.assertGreaterEqual(n_noise, 1)
+        self.assertEqual(n_noise, int(np.sum(labels == -1)))
+        # 离群点应被归为未分箱 (-1)
+        self.assertEqual(labels[-1], -1)
+        self.assertEqual(labels[-2], -1)
+
+    def test_run_hdbscan_clustering_small_sample(self):
+        """测试样本量小于 min_cluster_size 时 HDBSCAN 优雅降级返回全噪声"""
+        embedding = np.random.randn(3, 100)
+        labels, n_clusters, n_noise = run_hdbscan_clustering(
+            embedding=embedding,
+            min_cluster_size=5
+        )
+        self.assertEqual(len(labels), 3)
+        self.assertEqual(n_clusters, 0)
+        self.assertEqual(n_noise, 3)
+        self.assertTrue(np.all(labels == -1))
+
+    def test_cluster_pipeline_with_hdbscan_option(self):
+        """测试主聚类 pipeline 切换为 HDBSCAN 对照组的分箱端到端执行与文件产出"""
+        import argparse
+        import logging
+
+        logger = logging.getLogger('TestHDBSCANPipeline')
+        num_contigs = 12
+        num_features = 138
+        contig_names = [f"seq_{i}" for i in range(num_contigs)]
+
+        # 构造两组明显密集的特征数据
+        data_arr = np.zeros((num_contigs, num_features), dtype=np.float32)
+        data_arr[:6, :50] = 5.0
+        data_arr[6:, 50:100] = -5.0
+        data_arr[:, -1] = 5000.0  # length 列
+        df = pd.DataFrame(data_arr, index=contig_names)
+        contig_dict = {name: "ATCG" * 1250 for name in contig_names}
+
+        model = NewBinModel(num_features=num_features)
+        model.eval()
+
+        args = argparse.Namespace(
+            clustering_algorithm='hdbscan',
+            hdbscan_min_cluster_size=4,
+            hdbscan_min_samples=None,
+            hdbscan_metric='euclidean',
+            recluster=False,
+            write_pre_reclustering_bins=False,
+            output_tag=None,
+            output_compression='none'
+        )
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            cluster(
+                logger=logger,
+                model=model,
+                data=df,
+                device=torch.device('cpu'),
+                is_combined=False,
+                n_sample=0,
+                out=tmpdir,
+                contig_dict=contig_dict,
+                args=args,
+                binned_length=1000,
+                minfasta=2000
+            )
+
+            # 验证生成了 contig_bins.tsv
+            contig_bins_path = os.path.join(tmpdir, 'contig_bins.tsv')
+            self.assertTrue(os.path.exists(contig_bins_path))
+            df_bins = pd.read_csv(contig_bins_path, sep='\t')
+            self.assertEqual(len(df_bins), num_contigs)
+            self.assertIn('contig', df_bins.columns)
+            self.assertIn('bin', df_bins.columns)
 
 
 if __name__ == '__main__':

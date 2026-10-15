@@ -54,7 +54,8 @@ def newbin_arg_parser():
         'generate_sequence_features_single',
         help='Generate sequence features (kmer + abundance) for single-sample / co-assembly mode. '
              'Produces data.csv and data_split.csv.')
-
+    _add_common_args(gen_single)
+    _add_feature_args(gen_single)
     gen_single.add_argument('--kmer',
                             required=False,
                             help='Only output data.csv with k-mer features (no coverage).',
@@ -64,9 +65,16 @@ def newbin_arg_parser():
     # ------------------------------------------------------------------
     #  generate_sequence_features_multi
     # ------------------------------------------------------------------
-    subparsers.add_parser(
+    gen_multi = subparsers.add_parser(
         'generate_sequence_features_multi',
         help='Generate sequence features for multi-sample mode.')
+    _add_common_args(gen_multi)
+    _add_feature_args(gen_multi)
+    gen_multi.add_argument('-s', '--separator',
+                           required=False,
+                           help='Separator character used in contig headers (default: ":").',
+                           dest='separator',
+                           default=':')
 
     # ------------------------------------------------------------------
     #  train_self
@@ -74,7 +82,8 @@ def newbin_arg_parser():
     train_self = subparsers.add_parser(
         'train_self',
         help='Train the NewBin model (self-supervised mode).')
-
+    _add_common_args(train_self)
+    _add_training_args(train_self)
     train_self.add_argument('--train-from-many',
                             required=False,
                             help='Train from multiple samples at once.',
@@ -85,26 +94,58 @@ def newbin_arg_parser():
     # ------------------------------------------------------------------
     #  bin  (short-read)
     # ------------------------------------------------------------------
-    subparsers.add_parser('bin',
+    bin_short = subparsers.add_parser('bin',
                           help='Cluster contigs using a trained model (short-read).')
+    _add_common_args(bin_short)
+    _add_binning_args(bin_short)
 
     # ------------------------------------------------------------------
     #  bin_long  (long-read)
     # ------------------------------------------------------------------
-    subparsers.add_parser('bin_long',
+    bin_long = subparsers.add_parser('bin_long',
                           help='Cluster contigs using a trained model (long-read).')
+    _add_common_args(bin_long)
+    _add_binning_args(bin_long)
 
     # ------------------------------------------------------------------
     #  single_easy_bin  (all-in-one)
     # ------------------------------------------------------------------
-    subparsers.add_parser('single_easy_bin',
+    single_easy = subparsers.add_parser('single_easy_bin',
                           help='All-in-one: generate features + train + bin (single / co-assembly).')
+    _add_common_args(single_easy)
+    _add_feature_args(single_easy)
+    _add_training_args(single_easy)
+    _add_binning_args(single_easy)
+    single_easy.add_argument('--kmer',
+                            required=False,
+                            help='Only output data.csv with k-mer features (no coverage).',
+                            dest='kmer',
+                            action='store_true')
+    single_easy.add_argument('--sequencing-type',
+                            required=False,
+                            help='Sequencing type (short_read or long_read).',
+                            dest='sequencing_type',
+                            default='short_read')
 
     # ------------------------------------------------------------------
     #  multi_easy_bin  (all-in-one)
     # ------------------------------------------------------------------
-    subparsers.add_parser('multi_easy_bin',
+    multi_easy = subparsers.add_parser('multi_easy_bin',
                           help='All-in-one: generate features + train + bin (multi-sample).')
+    _add_common_args(multi_easy)
+    _add_feature_args(multi_easy)
+    _add_training_args(multi_easy)
+    _add_binning_args(multi_easy)
+    multi_easy.add_argument('-s', '--separator',
+                           required=False,
+                           help='Separator character used in contig headers (default: ":").',
+                           dest='separator',
+                           default=':')
+    multi_easy.add_argument('--sequencing-type',
+                            required=False,
+                            help='Sequencing type (short_read or long_read).',
+                            dest='sequencing_type',
+                            default='short_read')
 
     # ------------------------------------------------------------------
     #  concatenate_fasta
@@ -121,11 +162,24 @@ def newbin_arg_parser():
                         dest='output', default=None)
 
     # ------------------------------------------------------------------
-    #  check_install
+    #  evaluate (Benchmark evaluation)
     # ------------------------------------------------------------------
-    subparsers.add_parser('check_install',
-                          aliases=['check-install'],
-                          help='Check whether required dependencies are present.')
+    eval_parser = subparsers.add_parser('evaluate',
+                                        help='Evaluate binning quality against Ground Truth or CheckM2.')
+    eval_parser.add_argument('-b', '--binned', required=True,
+                             help='Path to binning result CSV/TSV or bins directory.')
+    eval_parser.add_argument('-g', '--ground-truth', required=True,
+                             help='Ground truth labels CSV/TSV file.')
+    eval_parser.add_argument('-f', '--fasta', default=None,
+                             help='Original contigs FASTA file (for length weighting).')
+    eval_parser.add_argument('--contig-col', default=None,
+                             help='Column name for contigs in ground truth table.')
+    eval_parser.add_argument('--genome-col', default=None,
+                             help='Column name for genomes in ground truth table.')
+    eval_parser.add_argument('--short-threshold', type=int, default=2000,
+                             help='Length threshold for short contigs / plasmids (default: 2000 bp).')
+    eval_parser.add_argument('-o', '--output', default='eval_output',
+                             help='Output directory for evaluation reports.')
 
     return parser
 
@@ -134,43 +188,75 @@ def newbin_arg_parser():
 #  Shared argument groups (appended to multiple subparsers after creation)
 # --------------------------------------------------------------------------
 
+def _safe_add_arg(p, *args, **kwargs):
+    """Add argument to parser only if none of the flag strings are already registered."""
+    for arg in args:
+        if isinstance(arg, str) and arg.startswith('-') and arg in p._option_string_actions:
+            return None
+    return p.add_argument(*args, **kwargs)
+
+
 def _add_common_args(p):
     """Add arguments that are shared across most subcommands."""
-    p.add_argument('-i', '--input-fasta',
-                   required=False,
-                   help='Path to the input contigs FASTA file.',
-                   dest='contig_fasta',
-                   default=None)
-    p.add_argument('-o', '--output',
-                   required=True,
-                   help='Output directory (will be created if non-existent).',
-                   dest='output',
-                   default=None)
-    p.add_argument('-p', '--num-process',
-                   required=False,
-                   type=int,
-                   help='Number of subprocess used in parallel (0 = use all CPUs).',
-                   dest='num_process',
-                   default=0)
-    p.add_argument('--random-seed',
-                   required=False,
-                   type=int,
-                   help='Random seed.',
-                   dest='random_seed',
-                   default=0)
+    _safe_add_arg(p, '-i', '--input-fasta',
+                  required=False,
+                  help='Path to the input contigs FASTA file.',
+                  dest='contig_fasta',
+                  default=None)
+    _safe_add_arg(p, '-o', '--output',
+                  required=True,
+                  help='Output directory (will be created if non-existent).',
+                  dest='output',
+                  default=None)
+    _safe_add_arg(p, '-p', '--num-process',
+                  required=False,
+                  type=int,
+                  help='Number of subprocess used in parallel (0 = use all CPUs).',
+                  dest='num_process',
+                  default=0)
+    _safe_add_arg(p, '--random-seed',
+                  required=False,
+                  type=int,
+                  help='Random seed.',
+                  dest='random_seed',
+                  default=0)
 
 
 def _add_binning_args(p):
-    p.add_argument('-d', '--data',
+    _safe_add_arg(p, '-d', '--data',
+                  required=False,
+                  help='Path to the data.csv file.',
+                  dest='data',
+                  default=None)
+    _safe_add_arg(p, '--model-path',
+                  required=False,
+                  help='Path to a trained model (.pt) file.',
+                  dest='model_path',
+                  default=None)
+    p.add_argument('--clustering-algorithm',
                    required=False,
-                   help='Path to the data.csv file.',
-                   dest='data',
-                   default=None)
-    p.add_argument('--model-path',
+                   choices=['leiden', 'hdbscan'],
+                   help='Clustering algorithm: "leiden" (dual-track physical-prior graph) '
+                        'or "hdbscan" (spatial density ablation baseline).',
+                   dest='clustering_algorithm',
+                   default='leiden')
+    p.add_argument('--hdbscan-min-cluster-size',
                    required=False,
-                   help='Path to a trained model (.pt) file.',
-                   dest='model_path',
+                   type=int,
+                   help='Minimum cluster size for HDBSCAN baseline (default 5).',
+                   dest='hdbscan_min_cluster_size',
+                   default=5)
+    p.add_argument('--hdbscan-min-samples',
+                   required=False,
+                   type=int,
+                   help='Minimum samples for core point density in HDBSCAN (default None, follows min_cluster_size).',
+                   dest='hdbscan_min_samples',
                    default=None)
+    p.add_argument('--hdbscan-metric',
+                   required=False,
+                   help='Metric used for HDBSCAN distance calculation (default "euclidean").',
+                   dest='hdbscan_metric',
+                   default='euclidean')
     p.add_argument('--max-edges',
                    required=False,
                    type=int,
@@ -287,12 +373,12 @@ def _add_training_args(p):
                    help='Compute engine for training (auto/gpu/cpu).',
                    dest='engine',
                    default='auto')
-    p.add_argument('-d', '--data',
-                   required=False,
-                   nargs='*',
-                   help='Path(s) to data.csv file(s).',
-                   dest='data',
-                   default=None)
+    _safe_add_arg(p, '-d', '--data',
+                  required=False,
+                  nargs='*',
+                  help='Path(s) to data.csv file(s).',
+                  dest='data',
+                  default=None)
     p.add_argument('--data-split',
                    required=False,
                    nargs='*',
@@ -896,6 +982,18 @@ def main():
                                    args.output, args.separator,
                                    getattr(args, 'output_compression', 'none'))
         logger.info(f'Concatenated contigs written to {ofname}')
+
+    elif args.cmd == 'evaluate':
+        from .evaluate import run_benchmark
+        run_benchmark(
+            binned_path=args.binned,
+            gt_path=args.ground_truth,
+            fasta_path=args.fasta,
+            contig_col=args.contig_col,
+            genome_col=args.genome_col,
+            short_threshold=getattr(args, 'short_threshold', 2000),
+            output_dir=args.output
+        )
 
     else:
         logger.error(f'Unknown subcommand: {args.cmd}')

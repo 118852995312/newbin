@@ -137,8 +137,8 @@ def generate_kmer_features_from_fasta(
             if seq_len < 4:
                 cnt = np.zeros(nr_features, dtype=np.int64)
             else:
-                seq_bytes = np.frombuffer(seq.encode('ascii', errors='ignore'), dtype=np.uint8)
-                encoded = byte_map[seq_bytes]
+                seq_bytes = np.frombuffer(seq.encode('ascii', errors='ignore'), dtype=np.uint8) ##对应的ascii的值
+                encoded = byte_map[seq_bytes] ##字母对应的数字0,1,2,3
                 b0 = encoded[:-3].astype(np.int32)
                 b1 = encoded[1:-2].astype(np.int32)
                 b2 = encoded[2:-1].astype(np.int32)

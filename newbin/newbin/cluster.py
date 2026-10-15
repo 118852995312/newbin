@@ -581,48 +581,141 @@ def recluster_bins(logger, data, *,
     return contig_labels_reclustered
 
 
+def run_hdbscan_clustering(
+    embedding,
+    contig_names=None,
+    min_cluster_size: int = 5,
+    min_samples: int = None,
+    metric: str = 'euclidean',
+    cluster_selection_method: str = 'eom',
+    copy: bool = True,
+    **kwargs
+):
+    """
+    运行基于空间几何密度的 HDBSCAN 聚类算法基线 (消融实验对照组)。
+
+    参数:
+    ----------
+    embedding : np.ndarray
+        形状为 (N, D) 的特征嵌入矩阵。建议预先经过 L2 归一化以保证空间距离度量与余弦相似度的单调等价性。
+    contig_names : list, optional
+        长度为 N 的 contig 名称列表。
+    min_cluster_size : int, optional
+        形成一个有效簇所需的最小样本数，默认 5。
+    min_samples : int or None, optional
+        决定点被视为主干核心点的保守程度。若为 None，则默认跟随 min_cluster_size。
+    metric : str, optional
+        特征空间距离度量方法，默认 'euclidean'。
+    cluster_selection_method : str, optional
+        从层次树中提取平坦聚类的算法，'eom' (Excess of Mass) 或 'leaf'，默认 'eom'。
+    copy : bool, optional
+        是否复制输入数据，默认 True。
+
+    返回:
+    -------
+    contig_labels : np.ndarray
+        形状为 (N,) 的整型聚类标签数组。有效簇标签 >= 0，被判定为离群/噪声的点标记为 -1。
+    n_clusters : int
+        生成的有效簇（非噪声）数量。
+    n_noise : int
+        标记为噪声（未分箱，标签为 -1）的 contig 数量。
+    """
+    import numpy as np
+    from sklearn.cluster import HDBSCAN
+
+    if len(embedding) == 0:
+        return np.array([], dtype=int), 0, 0
+
+    if len(embedding) < min_cluster_size:
+        labels = np.full(len(embedding), fill_value=-1, dtype=int)
+        return labels, 0, len(embedding)
+
+    clusterer = HDBSCAN(
+        min_cluster_size=min_cluster_size,
+        min_samples=min_samples,
+        metric=metric,
+        cluster_selection_method=cluster_selection_method,
+        copy=copy,
+        **kwargs
+    )
+    labels = clusterer.fit_predict(embedding)
+
+    unique_labels = set(labels)
+    n_clusters = len(unique_labels) - (1 if -1 in unique_labels else 0)
+    n_noise = int(np.sum(labels == -1))
+
+    return labels, n_clusters, n_noise
+
+
 def cluster(logger, model, data, device, is_combined,
             n_sample, out, contig_dict, *, args,
             binned_length, minfasta):
     """
-    使用双轨增强图与 Leiden 算法完成分箱聚类。
+    完成分箱聚类流程，支持双轨增强图 Leiden 聚类与 HDBSCAN 消融基线。
     """
     import pandas as pd
     from os import path
+    import numpy as np
 
-    k_neighbors = getattr(args, 'k_neighbors', 15)
-    pe_min_count = getattr(args, 'pe_min_count', 3)
-    pe_alpha = getattr(args, 'pe_alpha', 0.9)
-    pe_theta = getattr(args, 'pe_theta', 3.0)
-    pe_min_mapq = getattr(args, 'pe_min_mapq', 20)
-    resolution = getattr(args, 'leiden_resolution', 1.0)
-    pe_links = getattr(args, 'pe_links', None)
-    bams = getattr(args, 'bams', None)
-    cannot_link = getattr(args, 'cannot_link', None)
-    pe_cache = os.path.join(out, 'pe_links.csv')
-    pe_must_link = os.path.join(out, 'pe_must_link.csv')
+    clustering_algo = getattr(args, 'clustering_algorithm', 'leiden').lower()
 
-    embedding, contig_labels = run_dual_track_leiden(
-        logger, model, data,
-        device=device,
-        contig_dict=contig_dict,
-        bams=bams,
-        k_neighbors=k_neighbors,
-        pe_min_count=pe_min_count,
-        pe_alpha=pe_alpha,
-        pe_theta=pe_theta,
-        pe_min_mapq=pe_min_mapq,
-        pe_links_file=pe_links,
-        pe_cache_file=pe_cache,
-        pe_must_link_file=pe_must_link,
-        cannot_link=cannot_link,
-        resolution=resolution,
-        num_process=args.num_process
-    )
+    if clustering_algo == 'hdbscan':
+        import torch
+        from sklearn.preprocessing import normalize
+        logger.info('Running direct spatial density clustering baseline: HDBSCAN (euclidean)')
+        with torch.no_grad():
+            model.eval()
+            x_tensor = torch.from_numpy(data.values.astype(np.float32)).to(device)
+            embedding = model.embedding(x_tensor).detach().cpu().numpy()
+            embedding = normalize(embedding, norm='l2', axis=1)
 
-    if args.write_pre_reclustering_bins or not args.recluster:
+        min_cluster_size = getattr(args, 'hdbscan_min_cluster_size', 5)
+        min_samples = getattr(args, 'hdbscan_min_samples', None)
+        hdbscan_metric = getattr(args, 'hdbscan_metric', 'euclidean')
+
+        contig_labels, n_clusters, n_noise = run_hdbscan_clustering(
+            embedding=embedding,
+            contig_names=list(data.index),
+            min_cluster_size=min_cluster_size,
+            min_samples=min_samples,
+            metric=hdbscan_metric
+        )
+        logger.info(f'[HDBSCAN] Clustered into {n_clusters} clusters, {n_noise} noise/unbinned contigs '
+                    f'({100.0 * n_noise / len(contig_labels):.1f}% noise rate)')
+    else:
+        k_neighbors = getattr(args, 'k_neighbors', 15)
+        pe_min_count = getattr(args, 'pe_min_count', 3)
+        pe_alpha = getattr(args, 'pe_alpha', 0.9)
+        pe_theta = getattr(args, 'pe_theta', 3.0)
+        pe_min_mapq = getattr(args, 'pe_min_mapq', 20)
+        resolution = getattr(args, 'leiden_resolution', 1.0)
+        pe_links = getattr(args, 'pe_links', None)
+        bams = getattr(args, 'bams', None)
+        cannot_link = getattr(args, 'cannot_link', None)
+        pe_cache = os.path.join(out, 'pe_links.csv')
+        pe_must_link = os.path.join(out, 'pe_must_link.csv')
+
+        embedding, contig_labels = run_dual_track_leiden(
+            logger, model, data,
+            device=device,
+            contig_dict=contig_dict,
+            bams=bams,
+            k_neighbors=k_neighbors,
+            pe_min_count=pe_min_count,
+            pe_alpha=pe_alpha,
+            pe_theta=pe_theta,
+            pe_min_mapq=pe_min_mapq,
+            pe_links_file=pe_links,
+            pe_cache_file=pe_cache,
+            pe_must_link_file=pe_must_link,
+            cannot_link=cannot_link,
+            resolution=resolution,
+            num_process=args.num_process
+        )
+
+    if clustering_algo == 'hdbscan' or args.write_pre_reclustering_bins or not args.recluster:
         output_bin_path = os.path.join(out,
-                    'output_prerecluster_bins' if args.recluster else 'output_bins')
+                    'output_prerecluster_bins' if (args.recluster and clustering_algo != 'hdbscan') else 'output_bins')
         if os.path.exists(output_bin_path):
             logger.warning(f'Previous output directory `{output_bin_path}` found. Over-writing it.')
             shutil.rmtree(output_bin_path)
@@ -637,8 +730,10 @@ def cluster(logger, model, data, device, is_combined,
                             output_compression=args.output_compression)
         if not len(bin_files):
             logger.warning('No bins were created. Please check your input data.')
+            pd.DataFrame({'contig': data.index, 'bin': contig_labels}).to_csv(
+                os.path.join(out, 'contig_bins.tsv'), index=False, sep='\t')
             return
-        if not args.recluster:
+        if clustering_algo == 'hdbscan' or not args.recluster:
             logger.info(f'Number of bins: {len(bin_files)}')
             bin_files.to_csv(os.path.join(out, 'bins_info.tsv'), index=False, sep='\t')
             pd.DataFrame({'contig': data.index, 'bin': contig_labels}).to_csv(
@@ -649,15 +744,15 @@ def cluster(logger, model, data, device, is_combined,
         from collections import defaultdict
         total_size = defaultdict(int)
         for i, c in enumerate(contig_labels):
-            total_size[c] += len(contig_dict[data.index[i]])
+            if c != -1:
+                total_size[c] += len(contig_dict[data.index[i]])
         n_pre_bins = sum((total_size[bin_ix] >= minfasta for bin_ix in range(contig_labels.max() + 1)))
 
-    if args.recluster:
+    if clustering_algo != 'hdbscan' and args.recluster:
         logger.info(f'Number of bins prior to reclustering: {n_pre_bins}')
         logger.debug('Reclustering...')
 
         if n_pre_bins == 0:
-            import numpy as np
             logger.warning('No bins were created. Please check your input data.')
             contig_labels_reclustered = np.full(len(data.index), fill_value=-1, dtype=int)
         else:
