@@ -107,7 +107,7 @@ def generate_kmer_features_from_fasta(
     # 若 k=4 则预生成 2-bit 向量化查找表
     use_fast_4mer = (kmer_len == 4)
     if use_fast_4mer:
-        byte_map, lut_256 = _build_lut_4mer(kmer_dict)
+        byte_map, lut_256 = _build_lut_4mer(kmer_dict)  ##lut_256 是所有可能kmer计算的十进制数据对应的特征编号 byte_map 是kmer每个字符串对应ASCII的数字
 
     if contig_whitelist is not None and not isinstance(contig_whitelist, set):
         contig_whitelist = set(contig_whitelist)
@@ -144,9 +144,10 @@ def generate_kmer_features_from_fasta(
                 b2 = encoded[2:-1].astype(np.int32)
                 b3 = encoded[3:].astype(np.int32)
                 # 过滤包含非标准碱基（如 N）的窗口
-                valid = (b0 < 4) & (b1 < 4) & (b2 < 4) & (b3 < 4)
-                kmer_indices = (b0 << 6) | (b1 << 4) | (b2 << 2) | b3
+                valid = (b0 < 4) & (b1 < 4) & (b2 < 4) & (b3 < 4)  ##保证数据的有效性
+                kmer_indices = (b0 << 6) | (b1 << 4) | (b2 << 2) | b3  ##b0，b1.b2,b3 相同位置进行二进制编码，然后计算出十进制的结果
                 feat_ids = lut_256[kmer_indices[valid]]
+                ##统计 0∼135 这 136 种 4-mer 特征在当前这条 Contig 序列中各自出现了多少次（频数统计/唱票）。
                 cnt = np.bincount(feat_ids, minlength=nr_features)
         else:
             norm_seq = str(seq).upper()
