@@ -18,6 +18,13 @@
 
 set -euo pipefail
 
+# ==============================================================================
+# 全局日志记录配置 (所有 INFO、WARNING、ERROR 与标准输出均同步保存至 train.log)
+# ==============================================================================
+LOG_FILE="train.log"
+> "$LOG_FILE"  # 每次运行初始化日志文件
+exec > >(tee -a "$LOG_FILE") 2>&1
+
 # 终端高亮配色
 GREEN='\033[0;32m'
 YELLOW='\033[1;33m'
@@ -148,12 +155,12 @@ bin_and_eval_sample() {
     fi
 }
 
-# 单样本端到端串联 (仅 independent 模式使用)
+# 单样本端到端串联 (仅 independent 模式使用，其他阶段已注释)
 run_full_single_sample() {
     local cur_sample="$1"
-    prepare_sample "$cur_sample"
+    # prepare_sample "$cur_sample"
     train_sample "$cur_sample"
-    bin_and_eval_sample "$cur_sample"
+    # bin_and_eval_sample "$cur_sample"
 }
 
 # ------------------------------------------------------------------------------
@@ -210,21 +217,29 @@ dispatch_jobs() {
 }
 
 # ------------------------------------------------------------------------------
-# 主流程编排
+# 主流程编排 (仅保留阶段 2: 深度模型训练)
 # ------------------------------------------------------------------------------
 GLOBAL_START=$(date +%s)
 
 if [[ "$PIPELINE_MODE" == "joint" ]]; then
-    # 阶段 1: 并发特征工程
-    dispatch_jobs prepare_sample "阶段 1/3: 样本特征工程与多样本PE聚合" "${SAMPLE_LIST[@]}"
+    # 阶段 1: 并发特征工程 (暂时注释)
+    # echo -e "${YELLOW}>>> [阶段 1: 样本特征工程与多样本PE聚合 (已跳过/注释)]${NC}"
+    # dispatch_jobs prepare_sample "阶段 1/3: 样本特征工程与多样本PE聚合" "${SAMPLE_LIST[@]}"
 
-    # 阶段 2: 集中联合自监督训练
-    echo -e "\n${BOLD}${YELLOW}>>> [阶段 2/3: 多样本联合自监督训练] 汇聚 ${#SAMPLE_LIST[@]} 个样本联合训练全局模型...${NC}"
+    # 阶段 2: 集中联合自监督训练 (保留执行)
+    echo -e "\n${BOLD}${YELLOW}>>> [阶段 2: 多样本联合自监督训练] 汇聚 ${#SAMPLE_LIST[@]} 个样本联合训练全局模型...${NC}"
     ALL_DATA_CSVS=()
     for s in "${SAMPLE_LIST[@]}"; do
-        ALL_DATA_CSVS+=("${OUTPUT_BASE}/${s}/data.csv")
+        csv_path="${OUTPUT_BASE}/${s}/data.csv"
+        if [[ ! -f "$csv_path" ]]; then
+            echo -e "${YELLOW}警告: 未找到 ${csv_path}，请确认阶段 1 数据已生成！${NC}"
+        fi
+        ALL_DATA_CSVS+=("$csv_path")
     done
     mkdir -p "${OUTPUT_BASE}/joint_model"
+
+    echo -e "  - 训练日志将实时输出并同步保存至: ${CYAN}${LOG_FILE}${NC}"
+    echo -e "  - 正在启动模型训练...\n"
 
     $RUN newbin train_self \
         --train-from-many \
@@ -235,20 +250,23 @@ if [[ "$PIPELINE_MODE" == "joint" ]]; then
         --engine "$DEVICE"
 
     echo -e "${GREEN}✔ 全局联合模型训练完成，权重保存至: ${OUTPUT_BASE}/joint_model/model.pt${NC}\n"
+    cp -f "$LOG_FILE" "${OUTPUT_BASE}/joint_model/train.log" 2>/dev/null || true
 
-    # 阶段 3 & 4: 并发分箱与基准评估
-    dispatch_jobs bin_and_eval_sample "阶段 3/3: 双轨增强图分箱与基准评估" "${SAMPLE_LIST[@]}"
+    # 阶段 3 & 4: 并发分箱与基准评估 (暂时注释)
+    # echo -e "${YELLOW}>>> [阶段 3: 双轨增强图分箱与基准评估 (已跳过/注释)]${NC}"
+    # dispatch_jobs bin_and_eval_sample "阶段 3/3: 双轨增强图分箱与基准评估" "${SAMPLE_LIST[@]}"
 
 else
-    # 独立训练流水线
-    dispatch_jobs run_full_single_sample "样本独立端到端流水线" "${SAMPLE_LIST[@]}"
+    # 独立训练流水线 (仅保留阶段 2 训练)
+    dispatch_jobs train_sample "阶段 2: 样本独立模型训练" "${SAMPLE_LIST[@]}"
 fi
 
 GLOBAL_END=$(date +%s)
 echo -e "\n${CYAN}==============================================================================${NC}"
-echo -e "${BOLD}${GREEN}✔ NewBin 流水线全部执行完成！总耗时: $((GLOBAL_END - GLOBAL_START)) 秒${NC}"
+echo -e "${BOLD}${GREEN}✔ NewBin 模型训练全部执行完成！总耗时: $((GLOBAL_END - GLOBAL_START)) 秒${NC}"
 echo -e "  - 结果目录: ${OUTPUT_BASE}/"
 if [[ "$PIPELINE_MODE" == "joint" ]]; then
     echo -e "  - 全局通用模型: ${OUTPUT_BASE}/joint_model/model.pt"
 fi
+echo -e "  - 完整训练日志: ${LOG_FILE} (及 ${OUTPUT_BASE}/joint_model/train.log)"
 echo -e "${CYAN}==============================================================================${NC}\n"
