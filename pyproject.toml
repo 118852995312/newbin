@@ -23,7 +23,7 @@ classifiers = [
 dependencies = [
     "numpy",
     "pandas>=3",
-    "torch>=1.13",
+    "torch==2.3.1",
     "scikit-learn",
     "python-igraph",
     "scipy",
