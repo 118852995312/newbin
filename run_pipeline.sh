@@ -237,7 +237,27 @@ dispatch_jobs() {
         # 阶段 1: 并发特征工程 (已于此前完成)
         # dispatch_jobs prepare_sample "阶段 1/3: 样本特征工程与多样本PE聚合" "${SAMPLE_LIST[@]}"
 
-        # 阶段 2: 集中联合自监督训练 (复用昨日训练好的高质量模型)
+        # ----------------------------------------------------------------------
+        # 阶段 2: 集中联合自监督训练 (昨日已训练完成，原代码完整注释保留如下供查阅)
+        # ----------------------------------------------------------------------
+        # echo -e "\n${BOLD}${YELLOW}>>> [阶段 2/3: 多样本联合自监督训练] 汇聚 ${#SAMPLE_LIST[@]} 个样本联合训练全局模型...${NC}"
+        # ALL_DATA_CSVS=()
+        # for s in "${SAMPLE_LIST[@]}"; do
+        #     ALL_DATA_CSVS+=("${OUTPUT_BASE}/${s}/data.csv")
+        # done
+        # mkdir -p "${OUTPUT_BASE}/joint_model"
+        #
+        # $RUN newbin train_self \
+        #     --train-from-many \
+        #     -d "${ALL_DATA_CSVS[@]}" \
+        #     -o "${OUTPUT_BASE}/joint_model" \
+        #     --epochs "$EPOCHS" \
+        #     --batch-size "$BATCH_SIZE" \
+        #     --engine "$DEVICE"
+        #
+        # echo -e "${GREEN}✔ 全局联合模型训练完成，权重保存至: ${OUTPUT_BASE}/joint_model/model.pt${NC}\n"
+
+        # 检查并复用昨日训练好的模型权重:
         echo -e "\n${BOLD}${YELLOW}>>> [阶段 2: 全局模型检查] 正在加载昨日训练好的全局模型...${NC}"
         if [[ ! -f "${OUTPUT_BASE}/joint_model/model.pt" ]]; then
             echo -e "\033[0;31m错误: 未在 ${OUTPUT_BASE}/joint_model/ 找到训练好的 model.pt！\033[0m"
