@@ -21,7 +21,7 @@ set -euo pipefail
 # ==============================================================================
 # 全局日志记录配置
 # ==============================================================================
-LOG_FILE="train.log"
+LOG_FILE="bin_and_eval.log"
 > "$LOG_FILE"  # 每次运行初始化日志文件
 
 # 终端高亮配色
@@ -192,8 +192,14 @@ dispatch_jobs() {
                     next_pids+=("${pids[$i]}")
                     next_names+=("${names[$i]}")
                 else
-                    wait "${pids[$i]}"
-                    echo -e "${GREEN}  ✔ 样本 [${names[$i]}] 阶段完成${NC}"
+                    if wait "${pids[$i]}"; then
+                        echo -e "${GREEN}  ✔ 样本 [${names[$i]}] 阶段完成${NC}"
+                    else
+                        echo -e "\033[0;31m  ✖ 样本 [${names[$i]}] 运行失败！\033[0m"
+                        echo -e "\033[0;33m--- 最近 15 行日志 (${OUTPUT_BASE}/${names[$i]}/pipeline.log) ---\033[0m"
+                        tail -n 15 "${OUTPUT_BASE}/${names[$i]}/pipeline.log" 2>/dev/null || true
+                        exit 1
+                    fi
                 fi
             done
             pids=("${next_pids[@]}")
@@ -210,66 +216,50 @@ dispatch_jobs() {
     done
 
     for i in "${!pids[@]}"; do
-        wait "${pids[$i]}"
-        echo -e "${GREEN}  ✔ 样本 [${names[$i]}] 阶段完成${NC}"
+        if wait "${pids[$i]}"; then
+            echo -e "${GREEN}  ✔ 样本 [${names[$i]}] 阶段完成${NC}"
+        else
+            echo -e "\033[0;31m  ✖ 样本 [${names[$i]}] 运行失败！\033[0m"
+            echo -e "\033[0;33m--- 最近 15 行日志 (${OUTPUT_BASE}/${names[$i]}/pipeline.log) ---\033[0m"
+            tail -n 15 "${OUTPUT_BASE}/${names[$i]}/pipeline.log" 2>/dev/null || true
+            exit 1
+        fi
     done
 }
 
 # ------------------------------------------------------------------------------
-# 主流程编排 (仅保留阶段 2: 深度模型训练)
+# 主流程编排 (执行阶段 3: 双轨增强图分箱 与 阶段 4: 基准评估)
 # ------------------------------------------------------------------------------
 {
     GLOBAL_START=$(date +%s)
 
     if [[ "$PIPELINE_MODE" == "joint" ]]; then
-        # 阶段 1: 并发特征工程 (暂时注释)
-        # echo -e "${YELLOW}>>> [阶段 1: 样本特征工程与多样本PE聚合 (已跳过/注释)]${NC}"
+        # 阶段 1: 并发特征工程 (已于此前完成)
         # dispatch_jobs prepare_sample "阶段 1/3: 样本特征工程与多样本PE聚合" "${SAMPLE_LIST[@]}"
 
-        # 阶段 2: 集中联合自监督训练 (保留执行)
-        echo -e "\n${BOLD}${YELLOW}>>> [阶段 2: 多样本联合自监督训练] 汇聚 ${#SAMPLE_LIST[@]} 个样本联合训练全局模型...${NC}"
-        ALL_DATA_CSVS=()
-        for s in "${SAMPLE_LIST[@]}"; do
-            csv_path="${OUTPUT_BASE}/${s}/data.csv"
-            if [[ ! -f "$csv_path" ]]; then
-                echo -e "${YELLOW}警告: 未找到 ${csv_path}，请确认阶段 1 数据已生成！${NC}"
-            fi
-            ALL_DATA_CSVS+=("$csv_path")
-        done
-        mkdir -p "${OUTPUT_BASE}/joint_model"
+        # 阶段 2: 集中联合自监督训练 (复用昨日训练好的高质量模型)
+        echo -e "\n${BOLD}${YELLOW}>>> [阶段 2: 全局模型检查] 正在加载昨日训练好的全局模型...${NC}"
+        if [[ ! -f "${OUTPUT_BASE}/joint_model/model.pt" ]]; then
+            echo -e "\033[0;31m错误: 未在 ${OUTPUT_BASE}/joint_model/ 找到训练好的 model.pt！\033[0m"
+            exit 1
+        fi
+        echo -e "${GREEN}✔ 成功加载全局预训练模型: ${OUTPUT_BASE}/joint_model/model.pt${NC}\n"
 
-        echo -e "  - 训练日志将实时输出并同步保存至: ${CYAN}${LOG_FILE}${NC}"
-        echo -e "  - 正在启动模型训练...\n"
-
-        $RUN newbin train_self \
-            --train-from-many \
-            -d "${ALL_DATA_CSVS[@]}" \
-            -o "${OUTPUT_BASE}/joint_model" \
-            --epochs "$EPOCHS" \
-            --batch-size "$BATCH_SIZE" \
-            --engine "$DEVICE"
-
-        echo -e "${GREEN}✔ 全局联合模型训练完成，权重保存至: ${OUTPUT_BASE}/joint_model/model.pt${NC}\n"
-
-        # 阶段 3 & 4: 并发分箱与基准评估 (暂时注释)
-        # echo -e "${YELLOW}>>> [阶段 3: 双轨增强图分箱与基准评估 (已跳过/注释)]${NC}"
-        # dispatch_jobs bin_and_eval_sample "阶段 3/3: 双轨增强图分箱与基准评估" "${SAMPLE_LIST[@]}"
+        # 阶段 3 & 4: 并发分箱与基准评估 (正式启动)
+        dispatch_jobs bin_and_eval_sample "阶段 3/3: 双轨增强图分箱与基准评估" "${SAMPLE_LIST[@]}"
 
     else
-        # 独立训练流水线 (仅保留阶段 2 训练)
-        dispatch_jobs train_sample "阶段 2: 样本独立模型训练" "${SAMPLE_LIST[@]}"
+        # 独立训练流水线 (执行分箱与评估)
+        dispatch_jobs bin_and_eval_sample "阶段 3: 样本分箱与基准评估" "${SAMPLE_LIST[@]}"
     fi
 
     GLOBAL_END=$(date +%s)
     echo -e "\n${CYAN}==============================================================================${NC}"
-    echo -e "${BOLD}${GREEN}✔ NewBin 模型训练全部执行完成！总耗时: $((GLOBAL_END - GLOBAL_START)) 秒${NC}"
+    echo -e "${BOLD}${GREEN}✔ NewBin 图分箱与基准评估全部执行完成！总耗时: $((GLOBAL_END - GLOBAL_START)) 秒${NC}"
     echo -e "  - 结果目录: ${OUTPUT_BASE}/"
-    if [[ "$PIPELINE_MODE" == "joint" ]]; then
-        echo -e "  - 全局通用模型: ${OUTPUT_BASE}/joint_model/model.pt"
-    fi
-    echo -e "  - 完整训练日志: ${LOG_FILE} (及 ${OUTPUT_BASE}/joint_model/train.log)"
+    echo -e "  - 各样本分箱分类表:   ${OUTPUT_BASE}/<样本名>/contig_bins.tsv"
+    echo -e "  - 各样本最终 MAG 文件: ${OUTPUT_BASE}/<样本名>/bins/"
+    echo -e "  - 各样本基准评估指标: ${OUTPUT_BASE}/<样本名>/eval/"
+    echo -e "  - 完整运行日志:       ${LOG_FILE}"
     echo -e "${CYAN}==============================================================================${NC}\n"
 } 2>&1 | tee -a "$LOG_FILE"
-
-# 备份一份日志到模型目录
-cp -f "$LOG_FILE" "${OUTPUT_BASE}/joint_model/train.log" 2>/dev/null || true
